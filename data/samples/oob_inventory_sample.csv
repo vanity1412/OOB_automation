@@ -1,0 +1,4 @@
+oob_name,hostname,device_type,vendor,model,serial,mgmt_ip,site,rack,u_position,expected_line,expected_alias,notes
+DEMO-CISCO-OOB,FW-HCM-EDGE-01,Firewall,Palo Alto,PA-3220,PA-DEMO-004,172.16.10.14,HCM-DC1,R03,U14,69,FW-HCM-EDGE-01,Sample ADD row for import preview
+DEMO-CISCO-OOB,PE-HCM-02,PE,Cisco,NCS-5501,FTX-DEMO-002,172.16.10.12,HCM-DC1,R02,U08,67,PE-HCM-02,Sample unchanged/update row
+DEMO-VIETTIX-OOB,SW-HN-ACCESS-02,Switch,Viettix,VX-DEMO,VX-DEMO-005,172.20.10.22,HN-POP1,R05,U21,13,SW-HN-ACCESS-02,Sample Viettix inventory row

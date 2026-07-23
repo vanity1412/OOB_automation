@@ -1,0 +1,34 @@
+{
+  "name": "Cisco IOS / IOS-XE OOB",
+  "vendor": "cisco",
+  "netmiko_device_type": "cisco_ios",
+  "commands": {
+    "version": [
+      "show version"
+    ],
+    "inventory": [
+      "show inventory"
+    ],
+    "lines": [
+      "show line"
+    ],
+    "users": [
+      "show users"
+    ],
+    "hosts": [
+      "show running-config | include ^ip host",
+      "show run | include ^ip host"
+    ],
+    "menu": [
+      "show running-config | include ^menu",
+      "show run | include ^menu"
+    ]
+  },
+  "reverse_tcp_base": 2000,
+  "notes": "Cisco terminal-server profile.",
+  "mapping_supported": true,
+  "min_line_retention_ratio": 0.6,
+  "command_timeout": 15,
+  "connect_timeout": 8,
+  "connect_retries": 2
+}
