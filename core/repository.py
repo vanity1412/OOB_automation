@@ -121,10 +121,12 @@ def save_device(
     *, device_id: int | None, oob_id: int | None, hostname: str,
     device_type: str, vendor: str, model: str, serial: str, mgmt_ip: str,
     site: str, rack: str, u_position: str, expected_line: int | None,
-    expected_alias: str, notes: str, verification_status: str = "UNVERIFIED",
+    expected_alias: str, notes: str, source: str = "", source_id: str = "",
+    last_imported_at: str = "", verification_status: str = "UNVERIFIED",
     verification_source: str = "", verified_hostname: str = "",
     verified_serial: str = "", verified_model: str = "",
-    verified_at: str = "", verified_by: str = "", verification_note: str = "",
+    verified_at: str = "", verified_by: str = "", verification_ticket_ref: str = "",
+    verification_confidence: float = 0.0, verification_note: str = "",
 ) -> int:
     hostname = hostname.strip()
     if not hostname:
@@ -138,7 +140,8 @@ def save_device(
     values = (
         oob_id, hostname, device_type.strip(), vendor.strip(), model.strip(),
         serial.strip(), mgmt_ip.strip(), site.strip(), rack.strip(),
-        u_position.strip(), expected_line, expected_alias, notes.strip(),
+        u_position.strip(), expected_line, expected_alias, source.strip(),
+        source_id.strip(), last_imported_at.strip(), notes.strip(),
     )
     with db() as conn:
         current_id = int(device_id or -1)
@@ -174,15 +177,19 @@ def save_device(
         verification_values = (
             status, verification_source.strip(), verified_hostname.strip(),
             verified_serial.strip(), verified_model.strip(), verified_at.strip(),
-            verified_by.strip(), verification_note.strip(),
+            verified_by.strip(), verification_ticket_ref.strip()[:128],
+            max(0.0, min(float(verification_confidence or 0), 1.0)),
+            verification_note.strip(),
         )
         if device_id:
             conn.execute(
                 """
                 UPDATE devices SET oob_id=?,hostname=?,device_type=?,vendor=?,model=?,serial=?,
-                    mgmt_ip=?,site=?,rack=?,u_position=?,expected_line=?,expected_alias=?,notes=?,
+                    mgmt_ip=?,site=?,rack=?,u_position=?,expected_line=?,expected_alias=?,
+                    source=?,source_id=?,last_imported_at=?,notes=?,
                     verification_status=?,verification_source=?,verified_hostname=?,
-                    verified_serial=?,verified_model=?,verified_at=?,verified_by=?,verification_note=?,
+                    verified_serial=?,verified_model=?,verified_at=?,verified_by=?,
+                    verification_ticket_ref=?,verification_confidence=?,verification_note=?,
                     updated_at=?
                 WHERE id=?
                 """,
@@ -193,15 +200,136 @@ def save_device(
             """
             INSERT INTO devices(
                 oob_id,hostname,device_type,vendor,model,serial,mgmt_ip,
-                site,rack,u_position,expected_line,expected_alias,notes,
+                site,rack,u_position,expected_line,expected_alias,source,source_id,last_imported_at,notes,
                 verification_status,verification_source,verified_hostname,
-                verified_serial,verified_model,verified_at,verified_by,verification_note,
+                verified_serial,verified_model,verified_at,verified_by,
+                verification_ticket_ref,verification_confidence,verification_note,
                 created_at,updated_at
-            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             values + verification_values + (stamp, stamp),
         )
         return int(cur.lastrowid)
+
+
+def update_device_verification(
+    *,
+    device_id: int,
+    status: str,
+    source: str = "",
+    verified_hostname: str | None = None,
+    verified_serial: str | None = None,
+    verified_model: str | None = None,
+    ticket_ref: str = "",
+    confidence: float = 0.0,
+    note: str = "",
+) -> None:
+    status = status.strip().upper() or "UNVERIFIED"
+    if status not in {"UNVERIFIED", "VERIFIED", "STALE"}:
+        raise ValueError("Verification status must be UNVERIFIED, VERIFIED, or STALE.")
+
+    stamp = now_ts()
+    actor = current_actor()
+    with db() as conn:
+        existing = conn.execute("SELECT * FROM devices WHERE id=?", (int(device_id),)).fetchone()
+        if not existing:
+            raise ValueError("Device not found.")
+
+        conn.execute(
+            """
+            UPDATE devices SET
+                verification_status=?,
+                verification_source=?,
+                verified_hostname=?,
+                verified_serial=?,
+                verified_model=?,
+                verified_at=?,
+                verified_by=?,
+                verification_ticket_ref=?,
+                verification_confidence=?,
+                verification_note=?,
+                updated_at=?
+            WHERE id=?
+            """,
+            (
+                status,
+                source.strip() or "operator",
+                (verified_hostname if verified_hostname is not None else existing["verified_hostname"]) or "",
+                (verified_serial if verified_serial is not None else existing["verified_serial"]) or "",
+                (verified_model if verified_model is not None else existing["verified_model"]) or "",
+                stamp,
+                actor,
+                ticket_ref.strip()[:128] or existing["verification_ticket_ref"] or "",
+                max(0.0, min(float(confidence or 0), 1.0)),
+                note.strip() or existing["verification_note"] or "",
+                stamp,
+                int(device_id),
+            ),
+        )
+
+
+def assign_device_console_line(
+    *,
+    device_id: int,
+    oob_id: int,
+    line_no: int,
+    expected_alias: str = "",
+    ticket_ref: str = "",
+    confidence: float = 0.0,
+    note: str = "",
+) -> None:
+    line_no = int(line_no)
+    stamp = now_ts()
+    actor = current_actor()
+    with db() as conn:
+        device = conn.execute("SELECT * FROM devices WHERE id=?", (int(device_id),)).fetchone()
+        if not device:
+            raise ValueError("Device not found.")
+        conflict = conn.execute(
+            """
+            SELECT id,hostname FROM devices
+            WHERE oob_id=? AND expected_line=? AND id!=?
+            LIMIT 1
+            """,
+            (int(oob_id), line_no, int(device_id)),
+        ).fetchone()
+        if conflict:
+            raise ValueError(f"Console line {line_no} already assigned to {conflict['hostname']}.")
+
+        verification_note = note.strip() or (
+            f"Operator assigned OOB {oob_id} line {line_no} to {device['hostname']}."
+        )
+        conn.execute(
+            """
+            UPDATE devices SET
+                oob_id=?,
+                expected_line=?,
+                expected_alias=?,
+                verification_status='VERIFIED',
+                verification_source='operator_line_assignment',
+                verified_hostname=?,
+                verified_at=?,
+                verified_by=?,
+                verification_ticket_ref=?,
+                verification_confidence=?,
+                verification_note=?,
+                updated_at=?
+            WHERE id=?
+            """,
+            (
+                int(oob_id),
+                line_no,
+                expected_alias.strip() or device["expected_alias"] or "",
+                device["hostname"],
+                stamp,
+                actor,
+                ticket_ref.strip()[:128],
+                max(0.0, min(float(confidence or 0), 1.0)),
+                verification_note,
+                stamp,
+                int(device_id),
+            ),
+        )
 
 
 def delete_device(device_id: int) -> None:
@@ -215,16 +343,23 @@ def upsert_detected(oob_id: int, rows: list[dict[str, Any]], scan_id: int) -> No
     with db() as conn:
         conn.execute("DELETE FROM detected_console WHERE oob_id=?", (oob_id,))
         for row in rows:
+            last_output_at = stamp if (row.get("raw_line") or row.get("session_user")) else ""
             conn.execute(
                 """
                 INSERT INTO detected_console(
-                    oob_id,line_no,alias,tcp_port,target_host,state,session_user,raw_line,scan_id,last_seen
-                ) VALUES(?,?,?,?,?,?,?,?,?,?)
+                    oob_id,line_no,alias,tcp_port,target_host,state,session_user,raw_line,
+                    session_health,health_reason,prompt_context,context_confidence,last_output_at,
+                    scan_id,last_seen
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     oob_id, row["line_no"], row.get("alias", ""), row.get("tcp_port"),
                     row.get("target_host", ""), row.get("state", "UNKNOWN"),
-                    row.get("session_user", ""), row.get("raw_line", ""), scan_id, stamp,
+                    row.get("session_user", ""), row.get("raw_line", ""),
+                    row.get("session_health", "UNKNOWN"), row.get("health_reason", ""),
+                    row.get("prompt_context", "UNKNOWN"), float(row.get("context_confidence", 0) or 0),
+                    row.get("last_output_at") or last_output_at,
+                    scan_id, stamp,
                 ),
             )
 
@@ -513,13 +648,17 @@ def save_snapshots(*, scan_id: int, oob_id: int, rows: list[dict[str, Any]]) -> 
             conn.execute(
                 """
                 INSERT INTO console_snapshots(
-                    scan_id,oob_id,line_no,alias,tcp_port,target_host,state,session_user,raw_line,captured_at
-                ) VALUES(?,?,?,?,?,?,?,?,?,?)
+                    scan_id,oob_id,line_no,alias,tcp_port,target_host,state,session_user,raw_line,
+                    session_health,health_reason,prompt_context,context_confidence,captured_at
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     scan_id, oob_id, row["line_no"], row.get("alias", ""), row.get("tcp_port"),
                     row.get("target_host", ""), row.get("state", "UNKNOWN"),
-                    row.get("session_user", ""), row.get("raw_line", ""), stamp,
+                    row.get("session_user", ""), row.get("raw_line", ""),
+                    row.get("session_health", "UNKNOWN"), row.get("health_reason", ""),
+                    row.get("prompt_context", "UNKNOWN"), float(row.get("context_confidence", 0) or 0),
+                    stamp,
                 ),
             )
 
@@ -909,8 +1048,8 @@ def operational_foundation_summary() -> list[dict[str, Any]]:
         {
             "Capability": "Vendor abstraction",
             "Status": "READY",
-            "Signal": "profiles/*.json driver boundary",
-            "Safe Next Step": "Add Vertiv/Opengear/Raritan as separate disabled-by-default profiles before parsing real output.",
+            "Signal": "Cisco CLI and Vertiv ACS API profiles",
+            "Safe Next Step": "Keep new vendor profiles out of production until real output/API payloads are verified.",
         },
         {
             "Capability": "Safe automation",
@@ -967,6 +1106,67 @@ def list_console_power_map(limit: int = 100) -> list[dict[str, Any]]:
             (int(limit),),
         ).fetchall()
     return [dict(r) for r in rows]
+
+
+def save_console_power_map(
+    *,
+    mapping_id: int | None = None,
+    oob_id: int,
+    device_id: int | None,
+    line_no: int | None,
+    pdu_name: str,
+    pdu_host: str,
+    outlet_label: str,
+    control_mode: str = "MANUAL",
+    verified_at: str = "",
+    notes: str = "",
+) -> int:
+    pdu_name = pdu_name.strip()
+    outlet_label = outlet_label.strip()
+    if not pdu_name or not outlet_label:
+        raise ValueError("PDU name and outlet label are required.")
+    control_mode = control_mode.strip().upper() or "MANUAL"
+    if control_mode != "MANUAL":
+        raise ValueError("Only MANUAL power mapping is allowed in this build.")
+    stamp = now_ts()
+    values = (
+        int(oob_id),
+        device_id,
+        None if line_no is None else int(line_no),
+        pdu_name,
+        pdu_host.strip(),
+        outlet_label,
+        control_mode,
+        verified_at.strip() or stamp,
+        notes.strip(),
+    )
+    with db() as conn:
+        if mapping_id:
+            conn.execute(
+                """
+                UPDATE console_power_map SET
+                    oob_id=?,device_id=?,line_no=?,pdu_name=?,pdu_host=?,outlet_label=?,
+                    control_mode=?,verified_at=?,notes=?,updated_at=?
+                WHERE id=?
+                """,
+                values + (stamp, int(mapping_id)),
+            )
+            return int(mapping_id)
+        cur = conn.execute(
+            """
+            INSERT INTO console_power_map(
+                oob_id,device_id,line_no,pdu_name,pdu_host,outlet_label,
+                control_mode,verified_at,notes,created_at,updated_at
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            values + (stamp, stamp),
+        )
+        return int(cur.lastrowid)
+
+
+def delete_console_power_map(mapping_id: int) -> None:
+    with db() as conn:
+        conn.execute("DELETE FROM console_power_map WHERE id=?", (int(mapping_id),))
 
 
 def list_readiness_checks(limit: int = 100) -> list[dict[str, Any]]:

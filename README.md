@@ -1,81 +1,197 @@
-# OOB Device Manager Hardened
+# OOB Device Manager
 
-Ứng dụng này là dashboard quản lý OOB/console server cho môi trường NOC/DC. Mục tiêu chính là:
+OOB Device Manager là ứng dụng local web dùng cho NOC/DC để quản lý thiết bị OOB, console line, inventory và các dấu hiệu cắm nhầm line. Mục tiêu thực tế của tool là giúp operator biết nhanh:
 
-- Kết nối SSH thật tới thiết bị OOB/terminal server.
-- Chạy các lệnh `show`/`display` an toàn để lấy trạng thái console line, alias, user session và snapshot.
-- So sánh snapshot giữa các lần scan để phát hiện thay đổi/mismatch.
-- Mở nhanh console hoặc management SSH bằng Windows terminal hoặc SecureCRT.
-- Lưu inventory, lịch sử scan, cảnh báo, audit và backup trong SQLite cục bộ.
+- OOB nào đang quản lý line nào.
+- Line nào đang rảnh, đang có người dùng, hoặc có dấu hiệu session treo.
+- Console line có khớp inventory hay không.
+- Alias trên OOB bị thiếu/sai thì có bằng chứng nào để xác minh thiết bị thật.
+- Thiết bị nào mới xuất hiện, đổi line, hoặc đang chiếm line chưa được quản lý.
+- Mapping console line với PDU/outlet đã được ghi nhận và xác minh chưa.
 
-Ứng dụng không lưu password thiết bị vào database, CSV, audit hoặc log của app.
+Tool được thiết kế theo hướng automation an toàn: ưu tiên scan, đối chiếu, cảnh báo, xác minh thủ công và lưu evidence trước. Các hành động nguy hiểm như tự reboot, tự kick session, tự cấu hình thiết bị production chưa được bật.
 
-## Kết luận nhanh sau khi đọc code
+## Trạng thái hiện tại
 
-Ứng dụng có thể dùng với thiết bị thật nếu thiết bị OOB hỗ trợ SSH CLI và profile lệnh/parser phù hợp.
+| Nhóm chức năng | Trạng thái | Ghi chú thực tế |
+|---|---:|---|
+| Quản lý OOB node | Đã có | Khai báo host, vendor/profile, SSH port, note, tags. |
+| Scan OOB qua SSH | Đã có | Dùng Netmiko để login OOB và chạy lệnh read-only. |
+| Parse console line | Đã có nền | Cisco dùng CLI parser; Vertiv/Avocent ACS800/ACS8000 dùng REST API read-only. Các profile chưa xác minh đã được gỡ khỏi app. |
+| Vertiv ACS API scan | Đã bổ sung | Gọi `/access/serialPorts`, `/serialPorts`, `/sessions`, `/system/info`; không gọi power hoặc kill session. |
+| Snapshot và lịch sử scan | Đã có | Lưu trạng thái line qua từng lần scan. |
+| So sánh inventory | Đã có | Phát hiện đổi line, alias mismatch, thiết bị mới. |
+| Miswire detection khi alias thiếu/sai | Đã bổ sung | Có `ALIAS_MISSING`, `UNVERIFIED_LINE`, `LINE_OCCUPIED_BY_UNKNOWN`. |
+| Verification workflow | Đã bổ sung | Operator gán line cho device, nhập ticket/note, confidence, verified_by. |
+| Session health | Đã bổ sung | Phân loại `ACTIVE_OPERATOR`, `STALE_SESSION`, `NO_OUTPUT`, `BOOTLOADER_OR_ROMMON`, `UNKNOWN_CONTEXT`. |
+| Import CSV | Đã có | Preview/diff/add/update inventory. |
+| Import Excel | Đã bổ sung | Hỗ trợ `.xlsx`, cần `openpyxl`. |
+| Inventory source tracking | Đã bổ sung | Có `source`, `source_id`, `last_imported_at`. |
+| Power PDU mapping | Đã bổ sung mức manual | CRUD mapping OOB line với PDU/outlet, chưa có reboot tự động. |
+| Quick terminal launcher | Đã có | Mở Windows Terminal/SSH/Telnet/SecureCRT tùy Settings. |
+| Scheduled scan | Chưa có | Nên làm sớm để tool thành monitoring thật. |
+| Alert Email/Slack/Teams/Zalo | Chưa có | Cần sau khi event ổn định. |
+| Credential vault/RBAC | Chưa có | Hiện app cố tình không lưu password thiết bị. |
+| Auto login qua console vào BRAS/PE | Chưa nên bật | Nên làm read-only probe sau khi session health và verification ổn. |
+| Auto kick session/reboot/config | Chưa bật | Rủi ro cao trong production, chỉ nên thêm sau guardrail nhiều lớp. |
 
-Trạng thái hiện tại:
+## Tool này dùng để làm gì trong thực tế
 
-| Phần | Tình trạng |
+Trong môi trường NOC/DC, OOB thường nối console tới BRAS, PE, switch, firewall, server appliance hoặc thiết bị truyền dẫn. Vấn đề thường gặp là:
+
+- Alias trên OOB không được đặt hoặc đặt sai.
+- Dây console bị cắm nhầm line sau khi triển khai/bảo trì.
+- Inventory nói BRAS-A nằm line 10 nhưng scan thực tế thấy line khác.
+- Console line báo busy nhưng không rõ đang có người thao tác hay session cũ bị treo.
+- Khi sự cố, operator mất thời gian tìm line, tìm port telnet/SSH, tìm ticket xác minh.
+- Mapping giữa console line và PDU outlet không rõ, dễ reboot nhầm thiết bị.
+
+OOB Device Manager giải quyết phần nền của bài toán đó:
+
+1. Scan trạng thái OOB.
+2. Lưu snapshot.
+3. So sánh với inventory mong đợi.
+4. Sinh cảnh báo rõ ràng.
+5. Cho operator xác minh bằng ticket/note.
+6. Lưu lại evidence để lần sau không phụ thuộc hoàn toàn vào alias.
+7. Chuẩn bị dữ liệu sạch trước khi làm automation sâu hơn.
+
+## Khái niệm trong app
+
+| Khái niệm | Ý nghĩa |
 |---|---|
-| Kết nối SSH thật tới OOB | Có, dùng Netmiko `ConnectHandler` |
-| Chạy lệnh `show`/`display` | Có, chỉ cho phép read-only command |
-| Cisco IOS/IOS-XE terminal server | Sẵn sàng nhất, profile đã bật mapping |
-| Reverse Telnet console `2000 + line` | Có, phù hợp convention Cisco terminal server |
-| Mở SecureCRT/Windows terminal | Có, app launch terminal ngoài app |
-| Tự cập nhật dashboard sau lệnh show | Có trong luồng `Connect & Scan` của app |
-| Tự đọc output người dùng gõ trong SecureCRT | Chưa có, vì SecureCRT đang là cửa sổ ngoài app |
-| Viettix/Opengear/Raritan/Vertiv | Có scaffold/profile nền, cần output thật để kiểm chứng parser |
-| Tự động cấu hình/reboot/power control | Chưa bật, mới có schema/guardrail nền |
+| OOB node | Thiết bị console server/terminal server, ví dụ Cisco terminal server hoặc Vertiv/Avocent ACS. |
+| Device | Thiết bị thật phía sau console line, ví dụ BRAS, PE, switch, firewall. |
+| Console line | Port/line trên OOB đang nối tới thiết bị thật. |
+| Alias | Tên line được cấu hình trên OOB. Alias có ích nhưng không nên tin tuyệt đối. |
+| Inventory | Danh sách thiết bị mong đợi, line mong đợi, alias mong đợi, site/rack/role. |
+| Snapshot | Kết quả scan tại một thời điểm. |
+| Verification | Bằng chứng operator đã xác minh line này đúng là thiết bị nào. |
+| Confidence | Độ tin cậy của xác minh, theo phần trăm. |
+| Power mapping | Mapping thủ công giữa OOB line và PDU/outlet. |
 
-Điểm quan trọng: nếu bạn bấm `Connect & Scan` trong app, app sẽ SSH vào thiết bị OOB, chạy các lệnh show theo profile, parse output và tự cập nhật bảng giám sát. Nếu bạn mở SecureCRT rồi tự gõ lệnh trong cửa sổ SecureCRT, app hiện chưa thể tự đọc ngược output đó để cập nhật dashboard.
+## Workflow vận hành khuyến nghị
 
-## Nguồn đối chiếu Internet
+### 1. Khai báo OOB
 
-Các quyết định kỹ thuật trong app phù hợp với những nguồn chính thức này:
+Vào phần quản lý OOB, thêm thiết bị OOB:
 
-- [Netmiko](https://ktbyers.github.io/netmiko/) là thư viện multi-vendor để kết nối CLI thiết bị mạng và chạy show/config command.
-- [Netmiko API docs](https://ktbyers.github.io/netmiko/docs/netmiko/index.html) mô tả `send_command` dùng `read_timeout` và chờ prompt thiết bị để kết thúc output.
-- [Netmiko common issues](https://ktbyers.github.io/netmiko/COMMON_ISSUES.html) ghi nhận `terminal_server` device type cho trường hợp kết nối qua terminal server.
-- [Cisco terminal server menu configuration](https://www.cisco.com/c/en/us/support/docs/dial-access/asynchronous-connections/200462-Terminal-server-configuration-using-Menu.html) mô tả port reverse Telnet lấy bằng `2000 + line`.
-- [Cisco dialup/reverse Telnet overview](https://www.cisco.com/c/en/us/support/docs/dial-access/dial-on-demand-routing-ddr/10202-chapter16.html) cũng nêu cách Telnet tới port `20yy`, trong đó `yy` là line number.
-- [SecureCRT official features](https://www.vandyke.com/products/securecrt/key_features.html) mô tả SecureCRT là terminal emulator hỗ trợ SSH/Telnet, session management, scripting và logging.
+- Tên OOB.
+- Host/IP quản trị.
+- Vendor/profile.
+- SSH port.
+- Site/rack/tags nếu có.
 
-## Công nghệ sử dụng
+Password không lưu cố định trong database. Khi scan thật, operator nhập credential theo phiên làm việc.
 
-| Thành phần | Vai trò |
+### 2. Scan OOB
+
+Bấm scan để app SSH vào OOB và chạy lệnh read-only theo profile. App sẽ:
+
+- Lấy danh sách console line.
+- Parse line number, alias, trạng thái available/busy, session user nếu có.
+- Lưu snapshot.
+- Cập nhật bảng detected console.
+- Tính session health.
+- Sinh alert nếu có mismatch.
+
+### 3. Đối chiếu inventory
+
+App so sánh kết quả scan với inventory đã khai báo/import:
+
+- Device đổi line.
+- Alias trên OOB khác expected alias.
+- Alias bị thiếu.
+- Line có thiết bị nhưng chưa biết là thiết bị nào.
+- Line có expected device nhưng chưa có bằng chứng xác minh.
+
+### 4. Xử lý alias thiếu hoặc sai
+
+Khi alias trống/sai, không nên để app tự đoán chắc chắn. Workflow an toàn là:
+
+1. Operator kiểm tra bằng cách mở console hoặc đối chiếu ticket/NMS/CMDB.
+2. Nếu xác minh đúng, chọn device tương ứng.
+3. Nhập ticket/change reference.
+4. Nhập note ngắn: đã xác minh bằng gì.
+5. Chọn confidence.
+6. Bấm Mark verified hoặc assign line.
+
+Sau bước này, app lưu `verified_by`, `verified_at`, `verification_note`, `verification_ticket`, `verification_confidence`.
+
+### 5. Xử lý session busy
+
+Session busy không đồng nghĩa line đang có người thật. App phân loại health để operator xem trước:
+
+| Health | Ý nghĩa |
 |---|---|
-| Python | Runtime chính |
-| Streamlit | Giao diện web local |
-| Netmiko | SSH CLI tới thiết bị mạng/OOB |
-| Pandas | Bảng dữ liệu, CSV import/export |
-| Altair | Biểu đồ analytics |
-| SQLite | Database local |
-| Windows batch | Cài đặt, chạy app, backup, mở device |
+| `AVAILABLE_CONFIRMED` | Line đang rảnh theo output OOB. |
+| `ACTIVE_OPERATOR` | Có session user rõ ràng, có thể đang có người thao tác. |
+| `BUSY_NO_USER` | Busy nhưng chưa thấy user, cần kiểm tra thêm. |
+| `STALE_SESSION` | Có dấu hiệu session treo hoặc quá lâu không có output. |
+| `NO_OUTPUT` | Không có output đủ để kết luận. |
+| `BOOTLOADER_OR_ROMMON` | Có dấu hiệu đang ở bootloader/ROMMON. |
+| `UNKNOWN_CONTEXT` | Không đủ dữ liệu để hiểu context. |
 
-File dependency:
+Hiện app chỉ phân loại và cho ghi note/mark stale/mark verified. Chưa tự kick session.
 
-```text
-requirements.txt
-```
+### 6. Import inventory
 
-Nội dung chính:
+Vào Data, tải template rồi nhập CSV hoặc Excel. Nên chuẩn hóa các cột:
 
-```text
-streamlit==1.60.0
-netmiko==4.7.0
-pandas>=2.2,<3.0
-```
+- Device name.
+- Site/rack.
+- Role/vendor/model nếu có.
+- Expected OOB.
+- Expected line.
+- Expected alias.
+- Source/source_id.
 
-## Cài đặt trên Windows
+Workflow tốt nhất là import từ nguồn đáng tin cậy trước, ví dụ Excel quản lý nội bộ, NetBox, CMDB hoặc NMS export.
+
+### 7. Power mapping
+
+Vào OOB Foundations để tạo mapping:
+
+- OOB.
+- Console line.
+- Device.
+- PDU name/host.
+- Outlet label.
+- Control mode: `MANUAL`.
+- Verification note.
+
+Giai đoạn hiện tại chỉ ghi nhận mapping. Không có nút reboot tự động để tránh rủi ro thao tác nhầm.
+
+### 8. Mở console nhanh
+
+Sau khi device có OOB/line, app có thể mở nhanh terminal theo Settings:
+
+- SSH tới management IP.
+- Telnet/reverse telnet tới console port.
+- SecureCRT nếu đã cấu hình path.
+- Windows Terminal nếu môi trường hỗ trợ.
+
+Các lựa chọn terminal nên để trong Settings để phần Data/Devices không bị dài dòng.
+
+## Các loại cảnh báo quan trọng
+
+| Event | Khi nào xuất hiện | Hành động khuyến nghị |
+|---|---|---|
+| `NEW_CONSOLE_DEVICE` | Scan thấy line/device mới chưa có trong inventory. | Kiểm tra line, assign device hoặc tạo inventory. |
+| `DEVICE_CONSOLE_LINE_CHANGED` | Device đang ở line khác expected line. | Kiểm tra cắm nhầm line hoặc inventory lỗi. |
+| `EXPECTED_ALIAS_MISMATCH` | Alias scan khác expected alias. | Kiểm tra alias trên OOB và cập nhật inventory/OOB. |
+| `ALIAS_MISSING` | Expected có alias nhưng OOB không trả alias. | Xác minh bằng chứng, không dựa vào alias. |
+| `UNVERIFIED_LINE` | Line có expected device nhưng chưa được xác minh. | Operator mark verified kèm ticket/note. |
+| `LINE_OCCUPIED_BY_UNKNOWN` | Line busy/occupied nhưng không map được device. | Kiểm tra thủ công, tạo hoặc assign inventory. |
+
+## Chạy app trên Windows
 
 Yêu cầu:
 
-- Windows có Python 3.10+.
-- Máy chạy app phải route/ACL tới IP quản trị của OOB.
-- OOB phải cho SSH vào port đã khai báo.
-- Nếu muốn mở console bằng Telnet, Windows Telnet Client cần được bật hoặc dùng SecureCRT.
-- Nếu muốn mở SecureCRT, cài SecureCRT và cấu hình path trong tab `Settings`.
+- Python 3.10+.
+- Máy chạy app có route/ACL tới IP quản trị OOB.
+- OOB cho phép SSH.
+- Nếu dùng SecureCRT, cấu hình đường dẫn SecureCRT trong Settings.
 
 Cài package:
 
@@ -83,7 +199,7 @@ Cài package:
 install_windows.bat
 ```
 
-Chạy app thật:
+Chạy app:
 
 ```bat
 run_windows.bat
@@ -95,513 +211,104 @@ Mở trình duyệt:
 http://127.0.0.1:8501
 ```
 
-Mặc định app bind vào `127.0.0.1`, không expose trực tiếp ra LAN. Nếu cần nhiều người dùng, nên đặt reverse proxy có authentication/TLS phía trước, không mở thẳng Streamlit ra mạng nội bộ.
+Nếu trình duyệt báo `127.0.0.1 refused connection`, thường là app chưa chạy hoặc Streamlit bị dừng. Chạy lại `run_windows.bat`, đợi cửa sổ báo local URL rồi mở lại link.
 
-## Chạy demo an toàn
+## Chạy test
 
-Tạo dữ liệu demo:
-
-```bat
-.venv\Scripts\python.exe scripts\seed_demo_data.py
-```
-
-Chạy app với database demo:
-
-```bat
-run_demo.bat
-```
-
-Demo dùng database:
-
-```text
-data/demo_oob_manager.db
-```
-
-Không bấm `Connect & Scan` trong demo trừ khi đã sửa OOB demo thành IP thiết bị thật.
-
-## Cấu trúc thư mục
-
-```text
-app.py                         Streamlit UI chính
-core/connection.py             SSH transport Netmiko
-core/scanner.py                Chạy lệnh show, parse, quality gate, snapshot, alert
-core/discovery.py              Parser output show line/show users/ip host
-core/change_detection.py       So sánh snapshot và tạo change event
-core/database.py               Schema SQLite, migration, audit, backup
-core/repository.py             Hàm đọc/ghi dữ liệu nghiệp vụ
-core/viewmodel.py              Ghép inventory + detected state cho UI
-core/importer.py               CSV import preview/apply
-core/terminal.py               Mở Windows SSH/Telnet/SecureCRT
-core/scan_lock.py              Khóa scan toàn cục
-profiles/*.json                Profile lệnh theo vendor/OOB
-scripts/connect_device.py      CLI mở console/SSH theo hostname/alias/IP
-scripts/seed_demo_data.py      Seed dữ liệu demo
-tests/*.py                     Smoke/regression tests
-data/oob_manager.db            SQLite production mặc định
-data/backups/                  Backup SQLite
-```
-
-## Các trang trong app
-
-### 1. Devices
-
-Trang giám sát chính.
-
-Hiển thị:
-
-- OOB node.
-- Console line.
-- Device/alias.
-- TCP port console.
-- Management IP.
-- Trạng thái line: `AVAILABLE`, `BUSY`, `UNKNOWN`.
-- User/session đang dùng console nếu parser đọc được.
-- Mapping health: `MATCH`, `MISMATCH`, `UNMANAGED`, `NOT DETECTED`, `NO LINE`.
-- Verification status: `UNVERIFIED`, `VERIFIED`, `STALE`.
-- Last seen.
-
-Thao tác:
-
-- Search hostname/alias/IP/serial/rack/site.
-- Filter theo status/mapping/OOB.
-- Mở OOB SSH.
-- Mở console line bằng Windows Telnet.
-- Mở console line bằng SecureCRT Telnet.
-- Mở management SSH bằng Windows SSH hoặc SecureCRT SSH.
-- Add/Edit inventory.
-- Add discovered unmanaged device vào inventory.
-
-### 2. OOB Nodes
-
-Khai báo thiết bị OOB/terminal server thật.
-
-Trường chính:
-
-- OOB name.
-- Profile.
-- Site.
-- IP/hostname.
-- SSH port.
-- Default username.
-- Notes.
-
-Password không khai báo ở đây. Password chỉ nhập tạm ở trang `Discovery`.
-
-### 3. Discovery
-
-Đây là luồng cập nhật dữ liệu từ thiết bị thật.
-
-Workflow:
-
-```text
-Chọn OOB
-  -> nhập username/password tạm
-  -> Connect & Scan
-  -> app SSH tới OOB bằng Netmiko
-  -> chạy các command show/display trong profile
-  -> parse output
-  -> quality gate
-  -> nếu pass: update detected_console + snapshot + change alerts
-  -> nếu reject: chỉ lưu raw output/issue, không ghi đè state hiện tại
-  -> disconnect SSH ngay
-  -> xóa password khỏi Streamlit session state
-```
-
-Với Cisco profile, app thử các nhóm lệnh:
-
-```text
-show version
-show inventory
-show line
-show users
-show running-config | include ^ip host
-show run | include ^ip host
-show running-config | include ^menu
-show run | include ^menu
-```
-
-Các lệnh discovery chỉ cho `show` hoặc `display`. Code chặn lệnh cấu hình/reboot/delete.
-
-Sau scan hợp lệ, dữ liệu tự cập nhật ở:
-
-- Devices dashboard.
-- Current detected state.
-- Snapshot history.
-- Change events.
-- Data analytics.
-
-### 4. Changes
-
-Trung tâm cảnh báo thay đổi.
-
-Loại event chính:
-
-- `DEVICE_CONSOLE_LINE_CHANGED`: device được kỳ vọng ở line này nhưng xuất hiện ở line khác.
-- `EXPECTED_ALIAS_MISMATCH`: line đúng nhưng alias khác kỳ vọng.
-- `EXPECTED_DEVICE_NOT_DETECTED`: device/line kỳ vọng không thấy trong scan hợp lệ.
-- `CONSOLE_MAPPING_CHANGED`: mapping line thay đổi so với snapshot trước.
-- `NEW_CONSOLE_DEVICE`: có alias mới chưa nằm trong inventory.
-- `CONSOLE_LINE_MISSING`: line từng có trong snapshot nhưng scan hiện tại không thấy.
-- `CONSOLE_SESSION_STARTED`: line chuyển sang busy.
-- `CONSOLE_SESSION_ENDED`: line hết busy.
-
-Có thể:
-
-- Acknowledge.
-- Resolve.
-- Reopen.
-- Ghi note.
-- Xem severity/status/occurrence/last_seen.
-
-App có dedup/rate-limit: cùng OOB + line + event type chưa resolved thì update event cũ, không spam event mới.
-
-### 5. Data
-
-Quản lý dữ liệu và vận hành.
-
-Chức năng:
-
-- Export inventory CSV.
-- Import inventory CSV có preview diff.
-- Backup SQLite ngay.
-- Analytics theo `24h`, `7 days`, `30 days`, `90 days`, custom range.
-- Xem scan history, scan issues, change events, audit.
-- Xem OOB Foundations: verified inventory, terminal context, session health, vendor abstraction, safe automation, power mapping, readiness checks.
-
-### 6. Settings
-
-Quản lý tuỳ chọn vận hành.
-
-Chức năng:
-
-- Terminal Launchers: SecureCRT path, console default, management SSH default.
-- Retention & Backups: retention snapshot/raw scan/backup và prune history.
-
-## Profile thiết bị
-
-Profile nằm trong:
-
-```text
-profiles/*.json
-```
-
-Profile hiện có:
-
-| Profile | Tình trạng |
-|---|---|
-| `cisco.json` | Sẵn sàng nhất, mapping_supported=true |
-| `viettix.json` | Fallback có command candidates, mapping_supported=false |
-| `opengear.json` | Scaffold, command rỗng, mapping_supported=false |
-| `raritan.json` | Scaffold, command rỗng, mapping_supported=false |
-| `vertiv.json` | Scaffold, command rỗng, mapping_supported=false |
-
-Với vendor chưa kiểm chứng, giữ `mapping_supported=false` cho đến khi có output thật và parser đã test. Khi `mapping_supported=false`, app vẫn có thể refresh line/session nếu parse được, nhưng không tạo mapping drift alert dựa trên alias chưa đáng tin.
-
-Ví dụ profile Cisco:
-
-```json
-{
-  "name": "Cisco IOS / IOS-XE OOB",
-  "vendor": "cisco",
-  "netmiko_device_type": "cisco_ios",
-  "reverse_tcp_base": 2000,
-  "mapping_supported": true,
-  "command_timeout": 15,
-  "connect_timeout": 8,
-  "connect_retries": 2
-}
-```
-
-## Parser và quality gate
-
-App không commit dữ liệu nếu parser có rủi ro tạo false positive.
-
-Scan bị reject khi:
-
-- Không nhận được output console-line.
-- Lệnh console-line trả CLI error.
-- Có output nhưng parser không đọc được line nào.
-- Số line parse được giảm bất thường so với baseline.
-
-Khi scan bị reject, app không:
-
-- Ghi đè `detected_console`.
-- Tạo snapshot mới.
-- Tạo change alert.
-
-Raw output và lỗi vẫn được lưu trong `scans`/`scan_issues` để chỉnh profile/parser.
-
-## Cập nhật tự động sau lệnh show
-
-Hiện tại có 2 kiểu chạy lệnh:
-
-### A. Lệnh show do app chạy trong `Connect & Scan`
-
-Đây là luồng được hỗ trợ đầy đủ.
-
-Khi bạn bấm `Connect & Scan`, app tự chạy các lệnh show trong profile. Output được parse và dashboard tự cập nhật ngay sau scan nếu pass quality gate.
-
-Đây là cách nên dùng cho monitoring định kỳ hoặc thao tác NOC.
-
-### B. Lệnh show bạn tự gõ trong SecureCRT
-
-App hiện không đọc được output từ cửa sổ SecureCRT ngoài app.
-
-Lý do: app chỉ launch SecureCRT bằng command line. SecureCRT chạy như process độc lập; output không quay về Streamlit/Netmiko session của app.
-
-Nếu yêu cầu bắt buộc là "gõ show trong SecureCRT và app tự cập nhật ngay", cần thêm một trong các hướng mở rộng:
-
-- Viết SecureCRT Python script ghi log/output theo format chuẩn rồi import vào app.
-- Bật SecureCRT session logging và thêm watcher/parser đọc log file.
-- Xây terminal tích hợp trong app, để app trực tiếp gửi command và nhận output.
-- Thêm API endpoint nội bộ để script SecureCRT gửi output về app.
-
-Trong bản hiện tại, workflow đúng là: thao tác tay trong SecureCRT khi cần console, sau đó chạy lại `Connect & Scan` để cập nhật trạng thái giám sát chính thức.
-
-## Kết nối thiết bị thật
-
-Checklist trước khi scan thiết bị thật:
-
-1. Máy chạy app ping/SSH được tới IP OOB.
-2. OOB cho phép SSH quản trị.
-3. Username có quyền chạy các lệnh show trong profile.
-4. Với Cisco terminal server, có `ip host alias 20xx <oob-ip>` hoặc cơ chế mapping tương đương.
-5. Line console dùng convention `2000 + line` nếu mở reverse Telnet.
-6. `show line` trả output có line TTY/console rõ ràng.
-7. `show users` trả session user nếu muốn theo dõi busy/user.
-8. `show running-config | include ^ip host` trả alias mapping nếu muốn mapping confidence.
-9. Chạy scan đầu tiên để tạo baseline.
-10. Chạy scan thứ hai sau thay đổi nhỏ đã biết để xác nhận alert đúng.
-
-Với thiết bị production, nên test bằng một OOB nhỏ/lab trước. Không bật mapping alert cho vendor mới khi parser chưa kiểm chứng.
-
-## Bảo mật credential
-
-Password lifecycle:
-
-```text
-Người dùng nhập password ở Discovery
-  -> app dùng password để SSH
-  -> sau authentication xóa biến local
-  -> scrub password/secret/passphrase khỏi object Netmiko
-  -> sau connect attempt, rerun Streamlit và clear password field
-  -> disconnect SSH sau scan
-```
-
-Password không được ghi vào:
-
-- SQLite.
-- CSV.
-- Audit.
-- Raw scan JSON.
-- App log do code tạo.
-
-Giới hạn thực tế: không phần mềm user-space nào đảm bảo chống memory dump/root-level debugging trên chính máy chạy app. Máy chạy app vẫn phải là máy quản trị tin cậy.
-
-## Global scan lock
-
-App dùng file lock:
-
-```text
-data/scan.lock
-```
-
-Chỉ một scan được chạy tại một thời điểm, kể cả khi nhiều browser session mở cùng app. Điều này tránh mở nhiều SSH session song song vào terminal server.
-
-Nếu app crash giữa scan, lock có stale recovery.
-
-## Backup và retention
-
-Database chính:
-
-```text
-data/oob_manager.db
-```
-
-Backup thủ công:
-
-```bat
-run_backup.bat
-```
-
-Hoặc trong UI:
-
-```text
-Data -> Backup SQLite Now
-```
-
-Tạo Windows Scheduled Task backup hằng ngày 02:00:
-
-```bat
-setup_daily_backup.bat
-```
-
-Gỡ scheduled task:
-
-```bat
-remove_daily_backup_task.bat
-```
-
-Retention mặc định:
-
-- Console snapshots: 90 ngày.
-- Raw scan output: 30 ngày.
-- Backup files: 30 file.
-
-Có thể chỉnh trong `Settings -> Retention & Backups`.
-
-## CLI mở nhanh thiết bị
-
-Script:
-
-```bat
-connect_device.bat BRAS-HCM-01
-```
-
-Hoặc:
-
-```bat
-.venv\Scripts\python.exe scripts\connect_device.py BRAS-HCM-01 --dry-run
-.venv\Scripts\python.exe scripts\connect_device.py BRAS-HCM-01 --mode console
-.venv\Scripts\python.exe scripts\connect_device.py BRAS-HCM-01 --mode mgmt
-```
-
-Script tìm theo:
-
-- Hostname inventory.
-- Expected alias.
-- Management IP.
-- Detected alias.
-
-Nếu mode là `console`, script mở OOB host + TCP port đã detect. Nếu mode là `mgmt`, script mở SSH management IP.
-
-## Database tables chính
-
-| Table | Vai trò |
-|---|---|
-| `oob_nodes` | Danh sách OOB/terminal server |
-| `devices` | Inventory thiết bị thật |
-| `detected_console` | Trạng thái hiện tại sau scan accepted |
-| `scans` | Lịch sử scan và raw JSON |
-| `scan_issues` | Parser/transport issue |
-| `console_snapshots` | Snapshot từng scan accepted |
-| `change_events` | Alert/change event |
-| `audit` | Audit thao tác |
-| `app_settings` | Retention/launcher settings |
-| `terminal_contexts` | Nền tảng phân biệt OOB/target/bootloader |
-| `console_power_map` | Nền tảng map console line với PDU/outlet |
-| `readiness_checks` | Nền tảng kiểm tra disaster readiness |
-| `safe_automation_runs` | Nền tảng guardrail automation |
-
-## Workflow vận hành thực tế
-
-### Onboarding một OOB Cisco terminal server
-
-1. Vào `OOB Nodes`.
-2. Add OOB với profile `cisco`.
-3. Nhập IP/hostname, SSH port, default username.
-4. Vào `Discovery`.
-5. Chọn OOB, nhập password tạm.
-6. Bấm `Connect & Scan`.
-7. Xem raw output nếu scan bị warning/reject.
-8. Nếu scan accepted, vào `Devices` xem line/alias/status.
-9. Add discovered device vào inventory hoặc import CSV.
-10. Chạy scan lần nữa để so sánh expected mapping với detected mapping.
-
-### Theo dõi hằng ngày
-
-1. Mở `Devices` để xem tổng quan line available/busy/mismatch.
-2. Mở `Changes` để xử lý alert mới.
-3. Khi cần vào console, mở SecureCRT Console hoặc Telnet Console từ device detail.
-4. Sau khi thao tác tay xong, chạy `Discovery -> Connect & Scan` để cập nhật trạng thái chính thức.
-5. Ghi note khi acknowledge/resolve alert.
-6. Kiểm tra `Data -> Analytics` theo 24h/7d/30d.
-
-### Điều tra drift/mismatch
-
-1. Xem alert trong `Changes`.
-2. Mở detail để xem old/new value, line, device, occurrence_count.
-3. Mở console hoặc management SSH nếu cần xác minh.
-4. Nếu inventory sai, sửa device expected line/alias.
-5. Nếu parser sai, xem `Raw discovery output` hoặc `Scan Issues`.
-6. Chạy lại scan.
-7. Resolve alert khi trạng thái đã đúng.
-
-### Import inventory hàng loạt
-
-1. Chuẩn bị CSV có các cột như sample `data/samples/oob_inventory_sample.csv`.
-2. Vào `Data`.
-3. Upload CSV.
-4. Xem preview diff.
-5. Mặc định dùng `Add only`.
-6. Chỉ chọn `Apply ADD + UPDATE` khi đã review diff.
-7. Apply.
-8. Chạy scan để đối chiếu inventory với thực tế.
-
-## Ứng dụng thực tế
-
-Ứng dụng phù hợp cho:
-
-- NOC theo dõi nhiều console server/OOB.
-- DC kiểm tra thiết bị nào đang cắm vào line nào.
-- Phát hiện cắm nhầm console line.
-- Phát hiện thiết bị unmanaged xuất hiện trên console server.
-- Biết line nào đang busy và user/session nào đang dùng.
-- Lưu baseline trước/sau bảo trì.
-- Audit thao tác mở terminal, scan, import, backup, acknowledge/resolve alert.
-- Chuẩn bị disaster recovery: biết console line, management IP, rack/U, OOB node, PDU mapping nền.
-- Chuẩn hóa workflow trước khi mở automation nguy hiểm.
-
-Ứng dụng chưa phù hợp để thay thế hoàn toàn:
-
-- SecureCRT terminal emulator đầy đủ.
-- Tool cấu hình hàng loạt.
-- Tool reboot/power-cycle tự động.
-- SIEM/syslog collector thời gian thực.
-- Nền tảng multi-user có phân quyền, nếu chỉ chạy Streamlit local mặc định.
-
-## Kiểm thử
-
-Các test hiện có nằm trong:
-
-```text
-tests/
-```
-
-Chạy smoke/regression thủ công:
+Các test quan trọng:
 
 ```bat
 .venv\Scripts\python.exe tests\test_parsers.py
 .venv\Scripts\python.exe tests\test_change_detection.py
 .venv\Scripts\python.exe tests\test_hardening_regressions.py
 .venv\Scripts\python.exe tests\test_data_analytics.py
+.venv\Scripts\python.exe tests\test_session_health.py
+.venv\Scripts\python.exe tests\test_foundation_workflows.py
 .venv\Scripts\python.exe tests\test_app_smoke.py
+.venv\Scripts\python.exe -m compileall app.py core tests
 ```
 
-Checklist UI demo:
+## Đánh giá phần automation nên sửa/đẩy tiếp
 
-```text
-data/samples/manual_test_checklist.md
-```
+### Nên làm sớm
 
-## Hướng mở rộng nên làm tiếp
+1. Scheduled scan trong UI.
+2. Alert ra Email/Slack/Teams/Zalo.
+3. Bộ sample output thật theo từng hãng OOB để hoàn thiện parser.
+4. Trang review alert tập trung: lọc theo severity, site, OOB, event type, trạng thái đã xử lý/chưa xử lý.
+5. Credential handling an toàn hơn: vault, Windows Credential Manager, hoặc nhập theo phiên, không lưu plaintext.
+6. RBAC nếu có nhiều người dùng: viewer/operator/admin.
+7. Audit trail rõ hơn cho mọi thao tác xác minh, assign line, sửa inventory, sửa power mapping.
 
-Ưu tiên nếu muốn tiến gần SecureCRT hơn:
+### Nên làm sau khi dữ liệu đã sạch
 
-1. Tích hợp terminal trong app hoặc script SecureCRT để app nhận output thật của lệnh người dùng gõ.
-2. Thêm parser `show version`/`show inventory` để tự cập nhật verified hostname/model/serial.
-3. Thêm profile thật cho Viettix/Opengear/Raritan/Vertiv từ output production.
-4. Thêm scheduler scan có credential vault hoặc prompt-on-demand, không lưu plaintext password.
-5. Thêm export report PDF/CSV cho alert và snapshot.
-6. Thêm role/auth nếu muốn dùng nhiều người qua LAN.
-7. Thêm read-only API để tích hợp NOC/SIEM.
+1. NetBox/CMDB/NMS integration.
+2. Read-only console probe vào thiết bị thật phía sau OOB.
+3. Tự nhận diện hostname/model/serial/version từ console output.
+4. Backup config thiết bị thật ở chế độ read-only.
+5. Mapping topology OOB -> line -> device -> rack/site -> PDU outlet.
 
-## Nguyên tắc an toàn khi mở rộng
+### Chưa nên tự động hóa trực tiếp trong production
 
-- Mặc định chỉ chạy `show`/`display`.
-- Không lưu password plaintext.
-- Không bật mapping alert cho vendor chưa kiểm chứng parser.
-- Không ghi đè state khi parser reject.
-- Không chạy nhiều SSH scan song song vào OOB.
-- Không expose Streamlit trực tiếp ra LAN nếu chưa có authentication.
-- Không tự động reboot/power-cycle khi chưa có context guard, ticket, xác nhận và mapping PDU đã verified.
+1. Tự kick console session.
+2. Tự reboot/power-cycle PDU outlet.
+3. Tự chạy lệnh cấu hình.
+4. Tự sửa mapping line trên OOB.
+5. Auto login hàng loạt qua console vào BRAS/PE production.
+
+Các mục này làm được về kỹ thuật, nhưng rủi ro vận hành cao. Nên bắt đầu bằng chế độ gợi ý/manual approval, yêu cầu ticket, hiển thị impact, và lưu audit đầy đủ.
+
+## Roadmap đề xuất
+
+### Phase 1 - Làm dữ liệu đáng tin
+
+- Hoàn thiện miswire detection không phụ thuộc alias.
+- Bổ sung verification workflow cho mọi line quan trọng.
+- Chuẩn hóa inventory import CSV/Excel.
+- Thêm trạng thái xử lý alert.
+- Gom evidence theo device/line.
+
+### Phase 2 - Monitoring thật
+
+- Scheduled scan.
+- Notification.
+- Dashboard theo site/OOB/severity.
+- Report thay đổi theo ngày/tuần.
+- Retention policy cho snapshot/log.
+
+### Phase 3 - Tích hợp nguồn dữ liệu
+
+- NetBox/CMDB/NMS import.
+- So sánh nhiều nguồn inventory.
+- Gắn `source`, `source_id`, `last_imported_at` cho từng device.
+- Conflict resolution khi nhiều nguồn khác nhau.
+
+### Phase 4 - Probe read-only qua console
+
+- Mở console line ở chế độ read-only.
+- Nhận diện prompt/context.
+- Chạy lệnh nhẹ như `show version`, `show inventory`.
+- Lưu output/evidence.
+- Không chạy config/reboot.
+
+### Phase 5 - Guarded automation
+
+- Manual approval bắt buộc.
+- Ticket bắt buộc.
+- Dry-run trước khi thực thi.
+- RBAC.
+- Audit đầy đủ.
+- Chỉ bật theo site/OOB/device đã verified.
+
+## Nguyên tắc an toàn
+
+- Không tin alias tuyệt đối.
+- Không tự sửa production khi chưa có verification.
+- Không lưu password thiết bị trong database.
+- Không reboot/kick session tự động khi chưa có RBAC, ticket và approval.
+- Parser phải có test fixture từ output thật.
+- Mọi hành động ảnh hưởng vận hành phải có audit.
+
+## Kết luận
+
+Tool hiện phù hợp nhất để làm nền vận hành OOB: quản lý inventory, scan console line, phát hiện mismatch, xác minh line, phân loại session health và chuẩn bị dữ liệu cho automation. Hướng phát triển đúng là tiếp tục củng cố dữ liệu và cảnh báo trước, sau đó mới đi vào read-only probe, rồi cuối cùng mới cân nhắc automation có tác động như kick session hoặc power-cycle.

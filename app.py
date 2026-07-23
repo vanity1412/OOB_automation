@@ -13,13 +13,15 @@ from netmiko.exceptions import NetmikoAuthenticationException, NetmikoTimeoutExc
 
 from core.connection import LiveOOB
 from core.database import audit, backup_db, init_db, prune_backups
-from core.importer import apply_inventory_import, preview_inventory_import
-from core.profiles import list_profiles, load_profile, save_profile
+from core.importer import IMPORT_FIELDS, apply_inventory_import, preview_inventory_import
+from core.profiles import list_profiles, load_profile
 from core.repository import (
     analytics_alert_severity,
     analytics_daily_summary,
+    assign_device_console_line,
     count_open_events,
     delete_device,
+    delete_console_power_map,
     delete_oob,
     get_device,
     get_oob,
@@ -39,8 +41,10 @@ from core.repository import (
     operational_foundation_summary,
     prune_history,
     save_device,
+    save_console_power_map,
     save_oob,
     set_setting,
+    update_device_verification,
     update_change_event_status,
 )
 from core.scan_lock import ScanBusyError, global_scan_lock
@@ -50,6 +54,13 @@ from core.terminal import (
     launch_securecrt_telnet,
     launch_windows_ssh,
     launch_windows_telnet,
+)
+from core.vertiv_api import (
+    VertivAPIAuthenticationError,
+    VertivAPIError,
+    VertivACSClient,
+    preflight_vertiv_api,
+    scan_vertiv_api,
 )
 from core.viewmodel import build_rows
 
@@ -639,9 +650,15 @@ VALUE_TONES = {
     "UNVERIFIED": "slate",
     "STALE": "red",
     "HEALTHY": "green",
+    "AVAILABLE_CONFIRMED": "green",
+    "ACTIVE_OPERATOR": "amber",
     "STALE_SESSION": "amber",
+    "BUSY_NO_USER": "amber",
+    "INCONSISTENT": "red",
     "NO_OUTPUT": "red",
     "BOOTLOADER": "amber",
+    "BOOTLOADER_OR_ROMMON": "amber",
+    "UNKNOWN_CONTEXT": "slate",
     "WRONG_BAUD": "red",
     "OOB": "blue",
     "TARGET": "green",
@@ -978,6 +995,7 @@ DEVICE_COLUMN_CONFIG = {
     "Alias": st.column_config.TextColumn("Alias", width="medium"),
     "Status": st.column_config.TextColumn("Status", width="small"),
     "Session": st.column_config.TextColumn("Session", width="small"),
+    "Health": st.column_config.TextColumn("Health", width="medium"),
     "Mapping": st.column_config.TextColumn("Mapping", width="medium"),
     "Verification": st.column_config.TextColumn("Verification", width="medium"),
     "Last Seen": st.column_config.TextColumn("Last Seen", width="medium"),
@@ -999,6 +1017,8 @@ if "device_edit_id" not in st.session_state:
     st.session_state.device_edit_id = None
 if "oob_edit_id" not in st.session_state:
     st.session_state.oob_edit_id = None
+if "power_map_edit_id" not in st.session_state:
+    st.session_state.power_map_edit_id = None
 
 live: LiveOOB = st.session_state.live
 profiles = list_profiles()
@@ -1098,19 +1118,73 @@ if active_page == "Devices":
     available = int((df["Status"] == "AVAILABLE").sum()) if not df.empty else 0
     busy = int((df["Status"] == "BUSY").sum()) if not df.empty else 0
     mismatch = int((df["Mapping"] == "MISMATCH").sum()) if not df.empty else 0
+    health_attention = int(df["Health"].isin(["STALE_SESSION", "BUSY_NO_USER", "INCONSISTENT", "NO_OUTPUT", "BOOTLOADER_OR_ROMMON", "UNKNOWN_CONTEXT"]).sum()) if not df.empty else 0
     open_alerts = sum(alert_counts.values())
 
-    m1,m2,m3,m4,m5 = st.columns(5)
+    m1,m2,m3,m4,m5,m6 = st.columns(6)
     render_kpi(m1, "Devices / Lines", total, "blue", "inventory + detected")
     render_kpi(m2, "Available", available, "green", "ready console")
     render_kpi(m3, "Busy", busy, "amber", "active sessions")
     render_kpi(m4, "Mismatch", mismatch, "red" if mismatch else "green", "mapping drift")
-    render_kpi(m5, "Open Alerts", open_alerts, "red" if open_alerts else "green", "needs attention")
+    render_kpi(m5, "Health Review", health_attention, "amber" if health_attention else "green", "session context")
+    render_kpi(m6, "Open Alerts", open_alerts, "red" if open_alerts else "green", "needs attention")
 
     if not df.empty:
         chart1, chart2 = st.columns(2)
         render_bar_chart(chart1, "Console Status", count_rows(df, "Status"))
-        render_bar_chart(chart2, "Mapping Health", count_rows(df, "Mapping"))
+        render_bar_chart(chart2, "Session Health", count_rows(df, "Health"))
+
+    st.write("**Quick Hostname Lookup**")
+    hostname_lookup = st.text_input(
+        "Hostname lookup",
+        placeholder="Type hostname to find OOB, line, alias, status, and management IP...",
+        label_visibility="collapsed",
+        key="hostname_lookup",
+    )
+    if hostname_lookup.strip():
+        if df.empty:
+            render_empty_state("No inventory or detected console data yet.")
+        else:
+            lookup_needle = hostname_lookup.strip().lower()
+            lookup_mask = pd.Series(False, index=df.index)
+            for col in ["Device", "Verified Hostname", "Alias", "Mgmt IP", "Serial"]:
+                lookup_mask |= (
+                    df[col]
+                    .fillna("")
+                    .astype(str)
+                    .str.lower()
+                    .str.contains(lookup_needle, regex=False)
+                )
+            lookup_df = df[lookup_mask].copy()
+            if lookup_df.empty:
+                st.warning("No hostname match found.")
+            else:
+                exact_mask = pd.Series(False, index=lookup_df.index)
+                for col in ["Device", "Verified Hostname", "Alias"]:
+                    exact_mask |= (
+                        lookup_df[col]
+                        .fillna("")
+                        .astype(str)
+                        .str.lower()
+                        .eq(lookup_needle)
+                    )
+                lookup_df["_Exact"] = exact_mask.astype(int)
+                lookup_df = lookup_df.sort_values(
+                    by=["_Exact", "OOB", "Line"],
+                    ascending=[False, True, True],
+                )
+                lookup_cols = [
+                    "OOB", "OOB Host", "Line", "Device", "Alias", "TCP Port",
+                    "Status", "Session", "Health", "Mgmt IP", "Mapping",
+                    "Verification", "Last Seen",
+                ]
+                st.dataframe(
+                    styled_table(lookup_df[lookup_cols]),
+                    width="stretch",
+                    hide_index=True,
+                    column_config=DEVICE_COLUMN_CONFIG,
+                    height=min(260, 75 + len(lookup_df) * 35),
+                )
 
     b1,b2,b3,b4 = st.columns([4,1.6,1.7,1.2])
     with b1:
@@ -1122,7 +1196,11 @@ if active_page == "Devices":
     with b2:
         filt = st.selectbox(
             "Filter",
-            ["All","AVAILABLE","BUSY","UNKNOWN","MISMATCH","UNMANAGED","NOT DETECTED","NO LINE"],
+            [
+                "All","AVAILABLE","BUSY","UNKNOWN","MISMATCH","UNMANAGED","NOT DETECTED","NO LINE",
+                "ACTIVE_OPERATOR","STALE_SESSION","BUSY_NO_USER","INCONSISTENT","NO_OUTPUT",
+                "BOOTLOADER_OR_ROMMON","UNKNOWN_CONTEXT",
+            ],
             label_visibility="collapsed",
         )
     with b3:
@@ -1155,6 +1233,8 @@ if active_page == "Devices":
         if filt != "All":
             if filt in {"MISMATCH","UNMANAGED","NOT DETECTED","NO LINE"}:
                 shown = shown[shown["Mapping"] == filt]
+            elif filt in {"ACTIVE_OPERATOR","STALE_SESSION","BUSY_NO_USER","INCONSISTENT","NO_OUTPUT","BOOTLOADER_OR_ROMMON","UNKNOWN_CONTEXT"}:
+                shown = shown[shown["Health"] == filt]
             else:
                 shown = shown[shown["Status"] == filt]
 
@@ -1163,7 +1243,7 @@ if active_page == "Devices":
 
     table_cols = [
         "OOB","Line","Device","Type","Mgmt IP",
-        "Alias","Status","Session","Mapping","Verification","Last Seen"
+        "Alias","Status","Session","Health","Mapping","Verification","Last Seen"
     ]
 
     if shown.empty:
@@ -1207,20 +1287,26 @@ if active_page == "Devices":
                 ["TCP Port", row["TCP Port"] or "-"],
                 ["Console Status", row["Status"]],
                 ["Session", row["Session"] or "-"],
+                ["Session Health", row.get("Health", "-") or "-"],
+                ["Health Reason", row.get("Health Reason", "-") or "-"],
+                ["Prompt Context", row.get("Prompt Context", "-") or "-"],
                 ["Mapping", row["Mapping"]],
                 ["Mgmt IP", row["Mgmt IP"] or "-"],
                 ["Vendor/Model", f"{row['Vendor']} {row['Model']}".strip() or "-"],
                 ["Serial", row["Serial"] or "-"],
                 ["Verification", row.get("Verification", "-") or "-"],
+                ["Verification Ticket", row.get("Verification Ticket", "-") or "-"],
+                ["Verification Confidence", row.get("Verification Confidence", "-")],
                 ["Verified Hostname", row.get("Verified Hostname", "-") or "-"],
                 ["Verified Serial", row.get("Verified Serial", "-") or "-"],
+                ["Inventory Source", row.get("Source", "-") or "-"],
                 ["Last Seen", row["Last Seen"] or "-"],
             ], columns=["Field","Value"])
             st.dataframe(
                 detail.astype(str),
                 width="stretch",
                 hide_index=True,
-                height=390,
+                height=460,
             )
 
         with c2:
@@ -1232,6 +1318,9 @@ if active_page == "Devices":
                 st.success("Console line available.")
             else:
                 st.info(f"Console state: {row['Status']}")
+
+            if row.get("Health") in {"STALE_SESSION", "BUSY_NO_USER", "INCONSISTENT", "NO_OUTPUT", "BOOTLOADER_OR_ROMMON", "UNKNOWN_CONTEXT"}:
+                st.warning(row.get("Health Reason") or f"Session health: {row.get('Health')}")
 
             if row["Alias"]:
                 st.code(str(row["Alias"]), language="text")
@@ -1384,10 +1473,179 @@ if active_page == "Devices":
                                 st.error(str(exc))
 
             if row["DeviceID"] is not None:
+                with st.expander("Line verification"):
+                    verify_ticket = st.text_input(
+                        "Ticket / change ref",
+                        value=row.get("Verification Ticket", ""),
+                        key=f"verify_ticket_{int(row['DeviceID'])}",
+                    )
+                    verify_confidence = st.slider(
+                        "Confidence",
+                        min_value=0.0,
+                        max_value=1.0,
+                        value=float(row.get("Verification Confidence", 0) or 0),
+                        step=0.05,
+                        key=f"verify_confidence_{int(row['DeviceID'])}",
+                    )
+                    verify_note = st.text_area(
+                        "Verification note",
+                        value="",
+                        height=80,
+                        key=f"verify_note_{int(row['DeviceID'])}",
+                    )
+                    v1,v2,v3 = st.columns(3)
+                    if v1.button("Mark verified", width="stretch", type="primary", key=f"verify_ok_{int(row['DeviceID'])}"):
+                        try:
+                            default_note = (
+                                f"OOB={row['OOB']}; line={row['Line']}; "
+                                f"alias={row['Alias'] or '-'}; health={row.get('Health', 'UNKNOWN')}"
+                            )
+                            update_device_verification(
+                                device_id=int(row["DeviceID"]),
+                                status="VERIFIED",
+                                source="operator_line_check",
+                                verified_hostname=str(row["Device"]),
+                                verified_serial=row.get("Verified Serial", ""),
+                                verified_model=row.get("Verified Model", ""),
+                                ticket_ref=verify_ticket,
+                                confidence=verify_confidence,
+                                note=verify_note.strip() or default_note,
+                            )
+                            audit(
+                                "verify_device_line",
+                                oob_id=row["OOBID"],
+                                device_id=int(row["DeviceID"]),
+                                detail=verify_note.strip() or default_note,
+                                ticket_ref=verify_ticket,
+                                note=verify_note.strip() or default_note,
+                            )
+                            st.rerun()
+                        except Exception as exc:
+                            st.error(str(exc))
+                    if v2.button("Mark stale", width="stretch", key=f"verify_stale_{int(row['DeviceID'])}"):
+                        try:
+                            default_note = (
+                                f"Marked stale from Devices view; OOB={row['OOB']}; line={row['Line']}."
+                            )
+                            update_device_verification(
+                                device_id=int(row["DeviceID"]),
+                                status="STALE",
+                                source="operator_review",
+                                ticket_ref=verify_ticket,
+                                confidence=verify_confidence,
+                                note=verify_note.strip() or default_note,
+                            )
+                            audit(
+                                "mark_device_stale",
+                                oob_id=row["OOBID"],
+                                device_id=int(row["DeviceID"]),
+                                detail=verify_note.strip() or default_note,
+                                ticket_ref=verify_ticket,
+                                note=verify_note.strip() or default_note,
+                            )
+                            st.rerun()
+                        except Exception as exc:
+                            st.error(str(exc))
+                    if v3.button("Add note", width="stretch", key=f"verify_note_only_{int(row['DeviceID'])}"):
+                        try:
+                            note_text = verify_note.strip() or (
+                                f"Review note for OOB={row['OOB']}; line={row['Line']}; "
+                                f"health={row.get('Health', 'UNKNOWN')}."
+                            )
+                            update_device_verification(
+                                device_id=int(row["DeviceID"]),
+                                status=str(row.get("Verification") or "UNVERIFIED"),
+                                source="operator_note",
+                                ticket_ref=verify_ticket,
+                                confidence=verify_confidence,
+                                note=note_text,
+                            )
+                            audit(
+                                "add_verification_note",
+                                oob_id=row["OOBID"],
+                                device_id=int(row["DeviceID"]),
+                                detail=note_text,
+                                ticket_ref=verify_ticket,
+                                note=note_text,
+                            )
+                            st.rerun()
+                        except Exception as exc:
+                            st.error(str(exc))
+
                 if st.button("Edit inventory", width="stretch"):
                     st.session_state.device_edit_id = int(row["DeviceID"])
                     st.rerun()
             elif row["Mapping"] == "UNMANAGED":
+                with st.expander("Assign to existing device"):
+                    assign_candidates = [
+                        d for d in list_devices()
+                        if d.get("id") and (
+                            d.get("expected_line") is None
+                            or d.get("verification_status") != "VERIFIED"
+                        )
+                    ]
+                    if not assign_candidates:
+                        st.caption("No unverified or unassigned inventory device.")
+                    else:
+                        assign_labels = {
+                            f"{d['hostname']} · {d.get('device_type') or '-'} · {d.get('site') or '-'}": d
+                            for d in assign_candidates
+                        }
+                        assign_label = st.selectbox(
+                            "Inventory device",
+                            list(assign_labels),
+                            key=f"assign_device_{row['OOBID']}_{row['Line']}",
+                        )
+                        assign_ticket = st.text_input(
+                            "Ticket / change ref",
+                            key=f"assign_ticket_{row['OOBID']}_{row['Line']}",
+                        )
+                        assign_confidence = st.slider(
+                            "Confidence",
+                            0.0,
+                            1.0,
+                            0.85,
+                            0.05,
+                            key=f"assign_confidence_{row['OOBID']}_{row['Line']}",
+                        )
+                        assign_note = st.text_area(
+                            "Evidence note",
+                            height=80,
+                            key=f"assign_note_{row['OOBID']}_{row['Line']}",
+                        )
+                        if st.button(
+                            "Assign line as verified",
+                            width="stretch",
+                            type="primary",
+                            key=f"assign_line_{row['OOBID']}_{row['Line']}",
+                        ):
+                            try:
+                                selected_device = assign_labels[assign_label]
+                                default_note = (
+                                    f"Assigned from detected line. OOB={row['OOB']}; line={row['Line']}; "
+                                    f"alias={row['Alias'] or '-'}; health={row.get('Health', 'UNKNOWN')}."
+                                )
+                                assign_device_console_line(
+                                    device_id=int(selected_device["id"]),
+                                    oob_id=int(row["OOBID"]),
+                                    line_no=int(row["Line"]),
+                                    expected_alias=str(row["Alias"] or ""),
+                                    ticket_ref=assign_ticket,
+                                    confidence=assign_confidence,
+                                    note=assign_note.strip() or default_note,
+                                )
+                                audit(
+                                    "assign_detected_line",
+                                    oob_id=int(row["OOBID"]),
+                                    device_id=int(selected_device["id"]),
+                                    detail=assign_note.strip() or default_note,
+                                    ticket_ref=assign_ticket,
+                                    note=assign_note.strip() or default_note,
+                                )
+                                st.rerun()
+                            except Exception as exc:
+                                st.error(str(exc))
+
                 if st.button(
                     "Add discovered device",
                     width="stretch",
@@ -1468,6 +1726,25 @@ if active_page == "Devices":
                     value=pre.get("Alias","") if is_new else existing["expected_alias"],
                 )
 
+            a,b,c = st.columns(3)
+            with a:
+                inventory_source = st.text_input(
+                    "Inventory Source",
+                    value="" if is_new else existing.get("source", ""),
+                    placeholder="CSV / Excel / NetBox / CMDB",
+                )
+            with b:
+                inventory_source_id = st.text_input(
+                    "Source ID",
+                    value="" if is_new else existing.get("source_id", ""),
+                )
+            with c:
+                last_imported_at = st.text_input(
+                    "Last Imported At",
+                    value="" if is_new else existing.get("last_imported_at", ""),
+                    placeholder="YYYY-MM-DD HH:MM",
+                )
+
             st.write("Verification")
             verify_statuses = ["UNVERIFIED", "VERIFIED", "STALE"]
             current_verify_status = (
@@ -1517,6 +1794,22 @@ if active_page == "Devices":
                     placeholder="show version / prompt / inventory",
                 )
 
+            a,b = st.columns([1.5,1])
+            with a:
+                verification_ticket_ref = st.text_input(
+                    "Verification Ticket",
+                    value="" if is_new else existing.get("verification_ticket_ref", ""),
+                )
+            with b:
+                verification_confidence = st.slider(
+                    "Confidence",
+                    min_value=0.0,
+                    max_value=1.0,
+                    value=float(0 if is_new else existing.get("verification_confidence", 0) or 0),
+                    step=0.05,
+                    key=f"device_form_confidence_{edit_id}",
+                )
+
             notes = st.text_area(
                 "Notes",
                 value="" if is_new else existing["notes"],
@@ -1555,6 +1848,9 @@ if active_page == "Devices":
                     expected_line=line_val,
                     expected_alias=expected_alias,
                     notes=notes,
+                    source=inventory_source,
+                    source_id=inventory_source_id,
+                    last_imported_at=last_imported_at,
                     verification_status=verification_status,
                     verification_source=verification_source,
                     verified_hostname=verified_hostname,
@@ -1562,6 +1858,8 @@ if active_page == "Devices":
                     verified_model=verified_model,
                     verified_at=verified_at,
                     verified_by=verified_by,
+                    verification_ticket_ref=verification_ticket_ref,
+                    verification_confidence=verification_confidence,
                     verification_note=verification_note,
                 )
                 audit(
@@ -1894,7 +2192,73 @@ if active_page == "Discovery":
         }
         label = st.selectbox("OOB", list(by_label))
         target = by_label[label]
-        profile = load_profile(target["profile_key"])
+        target_profile_key = str(target.get("profile_key") or "")
+        if target_profile_key not in profiles:
+            st.error(
+                "This OOB uses a removed or unsupported profile. "
+                "Edit the OOB node and choose cisco or vertiv before scanning."
+            )
+            st.stop()
+        profile = load_profile(target_profile_key)
+        profile_commands = profile.get("commands", {})
+        profile_line_commands = [
+            str(cmd).strip()
+            for cmd in profile_commands.get("lines", [])
+            if str(cmd).strip()
+        ]
+        profile_api_supported = bool(profile.get("api_supported"))
+
+        source_options: list[str] = []
+        if profile_api_supported:
+            source_options.append("Vertiv ACS API (read-only)")
+        if profile_line_commands:
+            source_options.append("OOB CLI qua Netmiko (read-only)")
+        source_options.extend([
+            "Console thiết bị phía sau OOB (chưa bật)",
+            "SecureCRT/log terminal ngoài app (chưa bật)",
+        ])
+        selected_scan_source = st.selectbox(
+            "Nguồn dữ liệu scan",
+            source_options,
+            help=(
+                "OOB CLI/API là phần app đang tự đọc output. Console phía sau OOB "
+                "và SecureCRT/log ngoài app sẽ làm sau để tránh rủi ro production."
+            ),
+        )
+        use_vertiv_api = selected_scan_source == "Vertiv ACS API (read-only)"
+        use_cli_scan = selected_scan_source == "OOB CLI qua Netmiko (read-only)"
+        profile_ready = use_vertiv_api or use_cli_scan
+
+        api_port = int(profile.get("api_default_port", 48048))
+        verify_tls = bool(profile.get("api_verify_tls_default", False))
+        if use_vertiv_api:
+            st.info(
+                "Vertiv ACS sẽ scan bằng REST API read-only: serial ports, active sessions, system info. "
+                "Không gọi power on/off/cycle và không kill session."
+            )
+            api_a, api_b = st.columns([1, 1])
+            with api_a:
+                api_port = int(
+                    st.number_input(
+                        "Vertiv API HTTPS Port",
+                        min_value=1,
+                        max_value=65535,
+                        value=int(profile.get("api_default_port", 48048)),
+                        step=1,
+                    )
+                )
+            with api_b:
+                verify_tls = st.checkbox(
+                    "Verify TLS certificate",
+                    value=bool(profile.get("api_verify_tls_default", False)),
+                    help="Bật nếu ACS dùng certificate hợp lệ. Tắt khi lab/OOB dùng self-signed certificate.",
+                )
+
+        if not profile_ready:
+            st.warning(
+                "Nguồn dữ liệu này chưa có engine an toàn trong app. "
+                "Hiện chỉ scan trực tiếp được OOB CLI qua Netmiko hoặc Vertiv ACS API read-only."
+            )
 
         a,b,c = st.columns([2,2,1])
         with a:
@@ -1910,8 +2274,64 @@ if active_page == "Discovery":
             st.write("")
             st.write("")
             connect_scan = st.button(
-                "Connect & Scan", type="primary", width="stretch"
+                "Connect & Scan", type="primary", width="stretch",
+                disabled=not profile_ready,
             )
+
+        test_vertiv_api = False
+        if use_vertiv_api:
+            test_vertiv_api = st.button(
+                "Test Vertiv API only",
+                width="stretch",
+                disabled=not profile_ready,
+                help="Chỉ login API và đọc serial ports/sessions; không lưu snapshot, không tạo alert.",
+            )
+
+        if test_vertiv_api:
+            if not username.strip() or not password:
+                st.session_state["_clear_disc_pass"] = True
+                st.session_state["_flash_error"] = "Cần username/password để test Vertiv API. Password field đã được xóa."
+                st.rerun()
+            try:
+                with st.spinner("Đang test Vertiv API read-only..."):
+                    client = VertivACSClient(
+                        host=target["host"],
+                        port=api_port,
+                        username=username,
+                        password=password,
+                        verify_tls=verify_tls,
+                        timeout=int(profile.get("api_timeout", 10)),
+                    )
+                    password = ""
+                    check = preflight_vertiv_api(client)
+                st.session_state["_clear_disc_pass"] = True
+                if check["ok"]:
+                    st.session_state["_flash_success"] = (
+                        f"Vertiv API OK: đọc được {check['serial_port_count']} serial port, "
+                        f"{check['session_count']} active session."
+                    )
+                else:
+                    st.session_state["_flash_warning"] = check["message"]
+                if check.get("session_error"):
+                    st.session_state["_flash_warning"] = (
+                        (st.session_state.get("_flash_warning") or "")
+                        + " Sessions endpoint warning: "
+                        + str(check["session_error"])
+                    )
+                st.rerun()
+            except VertivAPIAuthenticationError:
+                st.session_state["_clear_disc_pass"] = True
+                st.session_state["_flash_error"] = (
+                    "Vertiv API login failed. Kiểm tra username/password và quyền REST API."
+                )
+                st.rerun()
+            except VertivAPIError as exc:
+                st.session_state["_clear_disc_pass"] = True
+                st.session_state["_flash_error"] = (
+                    f"Vertiv API chưa sẵn sàng: {exc}. "
+                    "Kiểm tra API port, security profile/access rights, route/ACL hoặc TLS setting."
+                )
+                st.rerun()
 
         if connect_scan:
             if not username.strip() or not password:
@@ -1919,41 +2339,67 @@ if active_page == "Discovery":
                 st.session_state["_flash_error"] = "Cần username/password. Password field đã được xóa."
                 st.rerun()
             try:
-                with st.spinner("Đang SSH tuần tự, parse quality-check và compare snapshot..."):
+                spinner_text = (
+                    "Đang gọi Vertiv ACS API, normalize serial ports và compare snapshot..."
+                    if use_vertiv_api
+                    else "Đang SSH tuần tự, parse quality-check và compare snapshot..."
+                )
+                with st.spinner(spinner_text):
                     # Lock covers BOTH SSH connect and scan. No second browser/session can
                     # open another scan connection while this one is active.
                     with global_scan_lock():
-                        try:
-                            live.connect(
-                                oob_id=target["id"],
-                                name=target["name"],
+                        if use_vertiv_api:
+                            client = VertivACSClient(
                                 host=target["host"],
-                                port=target["port"],
+                                port=api_port,
                                 username=username,
                                 password=password,
-                                device_type=profile.get("netmiko_device_type", "cisco_ios"),
-                                profile_key=target["profile_key"],
-                                connect_timeout=int(profile.get("connect_timeout", 8)),
-                                retries=int(profile.get("connect_retries", 2)),
+                                verify_tls=verify_tls,
+                                timeout=int(profile.get("api_timeout", 10)),
                             )
-                            # Remove our local plaintext reference immediately after auth.
                             password = ""
-                            result = scan(
-                                live, target["id"], target["profile_key"], acquire_lock=False
-                            )
-                            st.session_state.last_scan = result
-                            st.session_state.last_scan_oob_id = target["id"]
-                            audit(
-                                "scan",
+                        else:
+                            try:
+                                live.connect(
+                                    oob_id=target["id"],
+                                    name=target["name"],
+                                    host=target["host"],
+                                    port=target["port"],
+                                    username=username,
+                                    password=password,
+                                    device_type=profile.get("netmiko_device_type", "cisco_ios"),
+                                    profile_key=target["profile_key"],
+                                    connect_timeout=int(profile.get("connect_timeout", 8)),
+                                    retries=int(profile.get("connect_retries", 2)),
+                                )
+                                # Remove our local plaintext reference immediately after auth.
+                                password = ""
+                                result = scan(
+                                    live, target["id"], target["profile_key"], acquire_lock=False
+                                )
+                            finally:
+                                # Short-lived scan session: never keep management SSH open in background.
+                                live.disconnect()
+
+                        if use_vertiv_api:
+                            result = scan_vertiv_api(
+                                client,
                                 oob_id=target["id"],
-                                detail=(
-                                    f"accepted={result['accepted']}; rows={len(result['records'])}; "
-                                    f"events={result['change_count']}; quality={result['parse_quality']:.2f}"
-                                ),
+                                profile=profile,
+                                acquire_lock=False,
                             )
-                        finally:
-                            # Short-lived scan session: never keep management SSH open in background.
-                            live.disconnect()
+
+                        st.session_state.last_scan = result
+                        st.session_state.last_scan_oob_id = target["id"]
+                        audit(
+                            "scan",
+                            oob_id=target["id"],
+                            detail=(
+                                f"transport={result.get('transport', 'SSH_CLI')}; "
+                                f"accepted={result['accepted']}; rows={len(result['records'])}; "
+                                f"events={result['change_count']}; quality={result['parse_quality']:.2f}"
+                            ),
+                        )
 
                 st.session_state["_clear_disc_pass"] = True
                 if not result["accepted"]:
@@ -1989,6 +2435,16 @@ if active_page == "Discovery":
                 st.session_state["_flash_error"] = (
                     "SSH timeout sau retry hữu hạn. Kiểm tra IP/port/routing/ACL hoặc stale SSH session."
                 )
+                st.rerun()
+            except VertivAPIAuthenticationError:
+                st.session_state["_clear_disc_pass"] = True
+                st.session_state["_flash_error"] = (
+                    "Vertiv API authentication failed. Kiểm tra username/password và quyền REST API."
+                )
+                st.rerun()
+            except VertivAPIError as exc:
+                st.session_state["_clear_disc_pass"] = True
+                st.session_state["_flash_error"] = f"Vertiv API error: {exc}"
                 st.rerun()
             except ScanBusyError as exc:
                 st.session_state["_clear_disc_pass"] = True
@@ -2041,28 +2497,13 @@ if active_page == "Discovery":
 
             with st.expander("Raw discovery output"):
                 for kind, item in result["raw"].items():
-                    st.write(f"**{kind}** · `{item.get('command') or 'no working command'}`")
-                    st.code(item.get("output", "") or "(empty)", language="text")
-
-        if target["profile_key"] == "viettix":
-            st.info(
-                "Viettix mapping is disabled until the parser is verified."
-            )
-            with st.expander("Edit Viettix discovery profile"):
-                profile_data = load_profile("viettix")
-                txt = st.text_area(
-                    "Profile JSON",
-                    value=json.dumps(profile_data, ensure_ascii=False, indent=2),
-                    height=430,
-                )
-                if st.button("Save Viettix Profile"):
-                    try:
-                        new_profile = json.loads(txt)
-                        save_profile("viettix", new_profile)
-                        audit("save_viettix_profile", detail="Profile updated")
-                        st.success("Đã lưu profile.")
-                    except Exception as exc:
-                        st.error(f"JSON/profile không hợp lệ: {exc}")
+                    label = item.get("command") or item.get("endpoint") or "no working command"
+                    st.write(f"**{kind}** · `{label}`")
+                    if "payload" in item:
+                        body = json.dumps(item.get("payload"), ensure_ascii=False, indent=2)
+                        st.code(body or "(empty)", language="json")
+                    else:
+                        st.code(item.get("output", "") or "(empty)", language="text")
 
 # ==============================================================
 # DATA
@@ -2074,7 +2515,7 @@ if active_page == "Data":
     devices = list_devices()
     inv_df = pd.DataFrame(devices)
 
-    a,b,c = st.columns(3)
+    a,b,c,d = st.columns(4)
     with a:
         if devices:
             csv = inv_df.to_csv(index=False).encode("utf-8-sig")
@@ -2085,8 +2526,17 @@ if active_page == "Data":
         else:
             st.button("Export Inventory CSV", disabled=True, width="stretch")
     with b:
-        uploaded = st.file_uploader("Import CSV", type=["csv"], label_visibility="collapsed")
+        template_csv = pd.DataFrame(columns=IMPORT_FIELDS).to_csv(index=False).encode("utf-8-sig")
+        st.download_button(
+            "Download Import Template",
+            template_csv,
+            "oob_inventory_template.csv",
+            "text/csv",
+            width="stretch",
+        )
     with c:
+        uploaded = st.file_uploader("Import CSV / Excel", type=["csv", "xlsx"], label_visibility="collapsed")
+    with d:
         if st.button("Backup SQLite Now", width="stretch"):
             path = backup_db()
             keep = int(get_setting("backup_keep_count", "30"))
@@ -2096,7 +2546,11 @@ if active_page == "Data":
 
     if uploaded is not None:
         try:
-            incoming = pd.read_csv(uploaded)
+            filename = (uploaded.name or "").lower()
+            if filename.endswith(".xlsx"):
+                incoming = pd.read_excel(uploaded)
+            else:
+                incoming = pd.read_csv(uploaded)
             preview = preview_inventory_import(incoming)
             st.write("**Import Preview / Diff**")
             if preview.issues:
@@ -2106,7 +2560,7 @@ if active_page == "Data":
             if not preview_df.empty:
                 show_cols = [
                     "action","oob_name","hostname","device_type","expected_line",
-                    "expected_alias","mgmt_ip","rack","changed_fields"
+                    "expected_alias","mgmt_ip","rack","source","source_id","changed_fields"
                 ]
                 st.dataframe(
                     styled_table(preview_df[[c for c in show_cols if c in preview_df.columns]]),
@@ -2464,7 +2918,8 @@ if active_page == "Data":
                 verified_cols = [
                     "hostname","oob_name","expected_line","expected_alias",
                     "verification_status","verified_hostname","verified_serial",
-                    "verified_at","verified_by","verification_note"
+                    "verification_confidence","verification_ticket_ref",
+                    "verified_at","verified_by","source","source_id","verification_note"
                 ]
                 st.dataframe(
                     styled_table(devices_foundation_df[[c for c in verified_cols if c in devices_foundation_df.columns]]),
@@ -2518,7 +2973,7 @@ if active_page == "Data":
                 render_empty_state("No console-to-power mappings yet. Reboot actions stay manual until outlet mapping is verified.")
             else:
                 power_cols = [
-                    "oob_name","device_name","line_no","pdu_name","pdu_host",
+                    "id","oob_name","device_name","line_no","pdu_name","pdu_host",
                     "outlet_label","control_mode","verified_at","notes"
                 ]
                 st.dataframe(
@@ -2526,6 +2981,162 @@ if active_page == "Data":
                     width="stretch",
                     hide_index=True,
                 )
+
+            p1,p2,p3 = st.columns([1,2,1])
+            if p1.button("+ Power Map", width="stretch"):
+                st.session_state.power_map_edit_id = -1
+                st.rerun()
+
+            selected_power_row = None
+            if not power_df.empty:
+                power_labels = {
+                    f"#{row['id']} · {row['oob_name']} · line {row.get('line_no') if has_value(row.get('line_no')) else '-'} · {row['pdu_name']}:{row['outlet_label']}": row
+                    for row in power_df.to_dict("records")
+                }
+                selected_power_label = p2.selectbox(
+                    "Power mapping",
+                    list(power_labels),
+                    label_visibility="collapsed",
+                    key="selected_power_mapping",
+                )
+                selected_power_row = power_labels[selected_power_label]
+                if p3.button("Edit selected", width="stretch"):
+                    st.session_state.power_map_edit_id = int(selected_power_row["id"])
+                    st.rerun()
+
+                delete_power = st.checkbox(
+                    "Confirm delete selected power mapping.",
+                    key="confirm_delete_power_mapping",
+                )
+                if st.button(
+                    "Delete selected power mapping",
+                    disabled=not delete_power,
+                    width="stretch",
+                ):
+                    delete_console_power_map(int(selected_power_row["id"]))
+                    audit(
+                        "delete_power_mapping",
+                        oob_id=selected_power_row.get("oob_id"),
+                        device_id=int(selected_power_row["device_id"]) if has_value(selected_power_row.get("device_id")) else None,
+                        detail=f"mapping={selected_power_row['id']}",
+                    )
+                    st.session_state.power_map_edit_id = None
+                    st.rerun()
+
+            pm_edit_id = st.session_state.power_map_edit_id
+            if pm_edit_id is not None:
+                existing_power = None
+                if pm_edit_id != -1 and not power_df.empty:
+                    matches = [r for r in power_df.to_dict("records") if int(r["id"]) == int(pm_edit_id)]
+                    existing_power = matches[0] if matches else None
+
+                st.write("**Add Power Mapping**" if pm_edit_id == -1 else "**Edit Power Mapping**")
+                if not oobs:
+                    st.warning("Add an OOB node first.")
+                else:
+                    device_rows_for_power = list_devices()
+                    power_oob_options = {x["name"]: x["id"] for x in oobs}
+                    default_power_oob = next(
+                        (
+                            i for i, name in enumerate(power_oob_options)
+                            if existing_power and power_oob_options[name] == existing_power.get("oob_id")
+                        ),
+                        0,
+                    )
+                    device_options = {"(No device)": None}
+                    device_options.update({d["hostname"]: d["id"] for d in device_rows_for_power})
+                    default_power_device = next(
+                        (
+                            i for i, name in enumerate(device_options)
+                            if existing_power
+                            and has_value(existing_power.get("device_id"))
+                            and device_options[name] == int(existing_power.get("device_id"))
+                        ),
+                        0,
+                    )
+                    existing_line_text = ""
+                    if existing_power and has_value(existing_power.get("line_no")):
+                        existing_line_text = str(int(float(existing_power.get("line_no"))))
+                    with st.form("power_map_form"):
+                        a,b,c = st.columns([1.4,1.4,1])
+                        with a:
+                            power_oob_name = st.selectbox(
+                                "OOB",
+                                list(power_oob_options),
+                                index=default_power_oob,
+                            )
+                        with b:
+                            power_device_name = st.selectbox(
+                                "Device",
+                                list(device_options),
+                                index=default_power_device,
+                            )
+                        with c:
+                            power_line_text = st.text_input(
+                                "Line",
+                                value=existing_line_text,
+                            )
+                        a,b,c = st.columns(3)
+                        with a:
+                            pdu_name = st.text_input(
+                                "PDU Name",
+                                value="" if not existing_power else existing_power.get("pdu_name", ""),
+                            )
+                        with b:
+                            pdu_host = st.text_input(
+                                "PDU Host",
+                                value="" if not existing_power else existing_power.get("pdu_host", ""),
+                            )
+                        with c:
+                            outlet_label = st.text_input(
+                                "Outlet Label",
+                                value="" if not existing_power else existing_power.get("outlet_label", ""),
+                            )
+                        a,b = st.columns([1,2])
+                        with a:
+                            control_mode = st.selectbox("Control Mode", ["MANUAL"], index=0)
+                        with b:
+                            power_verified_at = st.text_input(
+                                "Verified At",
+                                value="" if not existing_power else existing_power.get("verified_at", "") or "",
+                            )
+                        power_notes = st.text_area(
+                            "Notes",
+                            value="" if not existing_power else existing_power.get("notes", "") or "",
+                            height=80,
+                        )
+                        save_power = st.form_submit_button("Save Power Mapping", type="primary")
+                        cancel_power = st.form_submit_button("Cancel")
+
+                    if cancel_power:
+                        st.session_state.power_map_edit_id = None
+                        st.rerun()
+                    if save_power:
+                        try:
+                            power_line_no = int(power_line_text) if power_line_text.strip() else None
+                            mapping_id = save_console_power_map(
+                                mapping_id=None if pm_edit_id == -1 else int(pm_edit_id),
+                                oob_id=power_oob_options[power_oob_name],
+                                device_id=device_options[power_device_name],
+                                line_no=power_line_no,
+                                pdu_name=pdu_name,
+                                pdu_host=pdu_host,
+                                outlet_label=outlet_label,
+                                control_mode=control_mode,
+                                verified_at=power_verified_at,
+                                notes=power_notes,
+                            )
+                            audit(
+                                "save_power_mapping",
+                                oob_id=power_oob_options[power_oob_name],
+                                device_id=device_options[power_device_name],
+                                detail=f"mapping={mapping_id};line={power_line_no};pdu={pdu_name};outlet={outlet_label}",
+                                note=power_notes,
+                            )
+                            st.session_state.power_map_edit_id = None
+                            st.rerun()
+                        except Exception as exc:
+                            st.error(str(exc))
         with foundation_detail_3:
             if readiness_df.empty:
                 render_empty_state("No disaster readiness checks recorded yet. Use this foundation for reachability, port response, and credential-validity checks.")
@@ -2599,7 +3210,7 @@ if active_page == "Data":
             st.dataframe(
                 styled_table(snapshots_df[[
                     "id","scan_id","oob_name","line_no","alias","tcp_port",
-                    "state","session_user","captured_at"
+                    "state","session_user","session_health","captured_at"
                 ]]),
                 width="stretch",
                 hide_index=True,

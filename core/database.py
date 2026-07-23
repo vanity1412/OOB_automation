@@ -75,7 +75,20 @@ def init_db() -> None:
                 u_position TEXT DEFAULT '',
                 expected_line INTEGER,
                 expected_alias TEXT DEFAULT '',
+                source TEXT DEFAULT '',
+                source_id TEXT DEFAULT '',
+                last_imported_at TEXT DEFAULT '',
                 notes TEXT DEFAULT '',
+                verification_status TEXT DEFAULT 'UNVERIFIED',
+                verification_source TEXT DEFAULT '',
+                verified_hostname TEXT DEFAULT '',
+                verified_serial TEXT DEFAULT '',
+                verified_model TEXT DEFAULT '',
+                verified_at TEXT DEFAULT '',
+                verified_by TEXT DEFAULT '',
+                verification_ticket_ref TEXT DEFAULT '',
+                verification_confidence REAL DEFAULT 0,
+                verification_note TEXT DEFAULT '',
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP,
                 updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY(oob_id) REFERENCES oob_nodes(id) ON DELETE SET NULL,
@@ -92,6 +105,11 @@ def init_db() -> None:
                 state TEXT DEFAULT 'UNKNOWN',
                 session_user TEXT DEFAULT '',
                 raw_line TEXT DEFAULT '',
+                session_health TEXT DEFAULT 'UNKNOWN',
+                health_reason TEXT DEFAULT '',
+                prompt_context TEXT DEFAULT 'UNKNOWN',
+                context_confidence REAL DEFAULT 0,
+                last_output_at TEXT DEFAULT '',
                 scan_id INTEGER,
                 last_seen TEXT DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY(oob_id) REFERENCES oob_nodes(id) ON DELETE CASCADE,
@@ -135,6 +153,10 @@ def init_db() -> None:
                 state TEXT DEFAULT 'UNKNOWN',
                 session_user TEXT DEFAULT '',
                 raw_line TEXT DEFAULT '',
+                session_health TEXT DEFAULT 'UNKNOWN',
+                health_reason TEXT DEFAULT '',
+                prompt_context TEXT DEFAULT 'UNKNOWN',
+                context_confidence REAL DEFAULT 0,
                 captured_at TEXT DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY(scan_id) REFERENCES scans(id) ON DELETE CASCADE,
                 FOREIGN KEY(oob_id) REFERENCES oob_nodes(id) ON DELETE CASCADE
@@ -271,18 +293,27 @@ def init_db() -> None:
 
         # Safe migrations from previous builds.
         _ensure_column(conn, "devices", "verification_status", "TEXT DEFAULT 'UNVERIFIED'")
+        _ensure_column(conn, "devices", "source", "TEXT DEFAULT ''")
+        _ensure_column(conn, "devices", "source_id", "TEXT DEFAULT ''")
+        _ensure_column(conn, "devices", "last_imported_at", "TEXT DEFAULT ''")
         _ensure_column(conn, "devices", "verification_source", "TEXT DEFAULT ''")
         _ensure_column(conn, "devices", "verified_hostname", "TEXT DEFAULT ''")
         _ensure_column(conn, "devices", "verified_serial", "TEXT DEFAULT ''")
         _ensure_column(conn, "devices", "verified_model", "TEXT DEFAULT ''")
         _ensure_column(conn, "devices", "verified_at", "TEXT DEFAULT ''")
         _ensure_column(conn, "devices", "verified_by", "TEXT DEFAULT ''")
+        _ensure_column(conn, "devices", "verification_ticket_ref", "TEXT DEFAULT ''")
+        _ensure_column(conn, "devices", "verification_confidence", "REAL DEFAULT 0")
         _ensure_column(conn, "devices", "verification_note", "TEXT DEFAULT ''")
         _ensure_column(conn, "detected_console", "session_health", "TEXT DEFAULT 'UNKNOWN'")
         _ensure_column(conn, "detected_console", "health_reason", "TEXT DEFAULT ''")
         _ensure_column(conn, "detected_console", "prompt_context", "TEXT DEFAULT 'UNKNOWN'")
         _ensure_column(conn, "detected_console", "context_confidence", "REAL DEFAULT 0")
         _ensure_column(conn, "detected_console", "last_output_at", "TEXT DEFAULT ''")
+        _ensure_column(conn, "console_snapshots", "session_health", "TEXT DEFAULT 'UNKNOWN'")
+        _ensure_column(conn, "console_snapshots", "health_reason", "TEXT DEFAULT ''")
+        _ensure_column(conn, "console_snapshots", "prompt_context", "TEXT DEFAULT 'UNKNOWN'")
+        _ensure_column(conn, "console_snapshots", "context_confidence", "REAL DEFAULT 0")
         _ensure_column(conn, "scans", "parse_status", "TEXT DEFAULT 'UNKNOWN'")
         _ensure_column(conn, "scans", "parse_quality", "REAL DEFAULT 0")
         _ensure_column(conn, "change_events", "last_seen", "TEXT DEFAULT ''")

@@ -1,5 +1,5 @@
 {
-  "name": "Vertiv / Avocent OOB (scaffold)",
+  "name": "Vertiv / Avocent ACS API",
   "vendor": "vertiv",
   "netmiko_device_type": "terminal_server",
   "commands": {
@@ -11,8 +11,12 @@
     "menu": []
   },
   "reverse_tcp_base": 2000,
-  "notes": "Disabled-by-default scaffold. Capture real Vertiv/Avocent CLI output before enabling commands or mapping alerts.",
-  "mapping_supported": false,
+  "notes": "Vertiv Avocent ACS800/ACS8000 REST API read-only profile. Uses /access/serialPorts, /serialPorts, /sessions and /system/info. Power and session-kill APIs stay disabled.",
+  "mapping_supported": true,
+  "api_supported": true,
+  "api_default_port": 48048,
+  "api_verify_tls_default": false,
+  "api_timeout": 10,
   "min_line_retention_ratio": 0.6,
   "command_timeout": 15,
   "connect_timeout": 8,

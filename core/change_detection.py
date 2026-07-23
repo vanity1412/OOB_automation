@@ -22,9 +22,10 @@ def detect_changes(
 
     Precedence for mapping-related conditions:
       1) DEVICE_CONSOLE_LINE_CHANGED
-      2) EXPECTED_ALIAS_MISMATCH
+      2) EXPECTED_ALIAS_MISMATCH / ALIAS_MISSING
       3) EXPECTED_DEVICE_NOT_DETECTED
-      4) CONSOLE_MAPPING_CHANGED / NEW_CONSOLE_DEVICE / CONSOLE_LINE_MISSING
+      4) UNVERIFIED_LINE
+      5) CONSOLE_MAPPING_CHANGED / NEW_CONSOLE_DEVICE / CONSOLE_LINE_MISSING
 
     Session events are independent INFO events and are emitted only when session
     parsing is trusted for the scan.
@@ -49,13 +50,13 @@ def detect_changes(
 
     events: list[dict[str, Any]] = []
     claimed_lines: set[int] = set()
-    claimed_devices: set[int] = set()
 
     # ---------- Inventory-aware events first ----------
     for device in inventory:
         device_id = int(device["id"])
         expected_line = device.get("expected_line")
         expected_alias = _norm(device.get("expected_alias"))
+        verification_status = _norm(device.get("verification_status")).upper() or "UNVERIFIED"
         hostname = _norm(device.get("hostname")) or "device"
 
         # Highest precedence: expected alias is found, but on another line.
@@ -70,11 +71,10 @@ def detect_changes(
                     "old_value": str(expected_line),
                     "new_value": str(detected_line),
                     "message": (
-                        f"{hostname} ({expected_alias}) được kỳ vọng ở line {expected_line} "
-                        f"nhưng hiện được phát hiện ở line {detected_line}."
+                        f"{hostname} ({expected_alias}) is expected on line {expected_line}, "
+                        f"but is detected on line {detected_line}."
                     ),
                 })
-                claimed_devices.add(device_id)
                 claimed_lines.update({int(expected_line), int(detected_line)})
                 continue
 
@@ -94,17 +94,33 @@ def detect_changes(
                 "old_value": expected_alias or hostname,
                 "new_value": "",
                 "message": (
-                    f"{hostname} được kỳ vọng ở line {expected_line} nhưng line/device "
-                    "không được phát hiện trong scan hợp lệ hiện tại."
+                    f"{hostname} is expected on line {expected_line}, but that line/device "
+                    "was not detected in the accepted scan."
                 ),
             })
-            claimed_devices.add(device_id)
+            claimed_lines.add(expected_line)
+            continue
+
+        actual_alias = _norm(row.get("alias"))
+
+        if mapping_confident and expected_alias and not actual_alias:
+            events.append({
+                "device_id": device_id,
+                "line_no": expected_line,
+                "event_type": "ALIAS_MISSING",
+                "severity": "WARNING",
+                "old_value": expected_alias,
+                "new_value": "",
+                "message": (
+                    f"{hostname}: expected alias {expected_alias} on line {expected_line}, "
+                    "but the accepted scan did not parse an alias for that line."
+                ),
+            })
             claimed_lines.add(expected_line)
             continue
 
         # Mapping mismatch only when alias parser is trusted.
         if mapping_confident and expected_alias:
-            actual_alias = _norm(row.get("alias"))
             if actual_alias and actual_alias.lower() != expected_alias.lower():
                 events.append({
                     "device_id": device_id,
@@ -114,12 +130,27 @@ def detect_changes(
                     "old_value": expected_alias,
                     "new_value": actual_alias,
                     "message": (
-                        f"{hostname}: expected alias {expected_alias} ở line {expected_line}, "
-                        f"nhưng phát hiện {actual_alias}."
+                        f"{hostname}: expected alias {expected_alias} on line {expected_line}, "
+                        f"but detected {actual_alias}."
                     ),
                 })
-                claimed_devices.add(device_id)
                 claimed_lines.add(expected_line)
+                continue
+
+        if verification_status != "VERIFIED" and (not expected_alias or not actual_alias):
+            events.append({
+                "device_id": device_id,
+                "line_no": expected_line,
+                "event_type": "UNVERIFIED_LINE",
+                "severity": "WARNING",
+                "old_value": verification_status,
+                "new_value": actual_alias or f"line {expected_line}",
+                "message": (
+                    f"{hostname} is detected on line {expected_line}, but identity is not verified. "
+                    "Verify from prompt/show output before trusting alias-only or alias-missing mapping."
+                ),
+            })
+            claimed_lines.add(expected_line)
 
     # ---------- Generic historical mapping changes ----------
     if emit_history_events:
@@ -138,12 +169,12 @@ def detect_changes(
                         "severity": "HIGH",
                         "old_value": old_alias,
                         "new_value": "",
-                        "message": f"Console line {line_no} không còn xuất hiện trong scan hiện tại.",
+                        "message": f"Console line {line_no} is missing from the current accepted scan.",
                     })
                 continue
 
             if old is None and new is not None:
-                if mapping_confident and line_no not in claimed_lines:
+                if mapping_confident and line_no not in claimed_lines and line_no not in inv_by_line:
                     alias = _norm(new.get("alias"))
                     # Only call it unmanaged/new if the alias is not a managed alias.
                     if alias and alias.lower() not in inv_by_alias:
@@ -154,7 +185,20 @@ def detect_changes(
                             "severity": "WARNING",
                             "old_value": "",
                             "new_value": alias,
-                            "message": f"Phát hiện console mapping mới trên line {line_no}: {alias}.",
+                            "message": f"New console mapping detected on line {line_no}: {alias}.",
+                        })
+                    elif not alias:
+                        events.append({
+                            "device_id": None,
+                            "line_no": line_no,
+                            "event_type": "LINE_OCCUPIED_BY_UNKNOWN",
+                            "severity": "WARNING",
+                            "old_value": "",
+                            "new_value": f"line {line_no}",
+                            "message": (
+                                f"Line {line_no} appeared in an accepted scan without inventory or alias. "
+                                "Add inventory or verify the physical console mapping."
+                            ),
                         })
                 continue
 
@@ -176,8 +220,8 @@ def detect_changes(
                         "old_value": old_alias,
                         "new_value": new_alias,
                         "message": (
-                            f"Console mapping line {line_no} thay đổi: "
-                            f"{old_alias or '(empty)'} → {new_alias or '(empty)'}."
+                            f"Console mapping line {line_no} changed: "
+                            f"{old_alias or '(empty)'} -> {new_alias or '(empty)'}."
                         ),
                     })
 
@@ -197,8 +241,8 @@ def detect_changes(
                             "old_value": f"{old_state}:{old_user}",
                             "new_value": f"{new_state}:{new_user}",
                             "message": (
-                                f"Console line {line_no} chuyển sang BUSY"
-                                + (f" bởi {new_user}." if new_user else ".")
+                                f"Console line {line_no} changed to BUSY"
+                                + (f" by {new_user}." if new_user else ".")
                             ),
                         })
                     elif old_state == "BUSY" and new_state != "BUSY":
@@ -209,7 +253,7 @@ def detect_changes(
                             "severity": "INFO",
                             "old_value": f"{old_state}:{old_user}",
                             "new_value": f"{new_state}:{new_user}",
-                            "message": f"Console line {line_no} không còn BUSY.",
+                            "message": f"Console line {line_no} is no longer BUSY.",
                         })
 
     # Exact duplicate guard within one scan.

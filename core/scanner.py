@@ -28,6 +28,7 @@ from .repository import (
     upsert_detected,
 )
 from .scan_lock import global_scan_lock
+from .session_health import annotate_session_health
 
 
 def first_working(
@@ -143,6 +144,7 @@ def scan(session, oob_id: int, profile_key: str, *, acquire_lock: bool = True) -
             effective_records = parsed_records
             if previous and not quality.mapping_confident:
                 effective_records = preserve_previous_mapping(parsed_records, previous)
+            effective_records = annotate_session_health(effective_records, previous)
 
             upsert_detected(oob_id, effective_records, scan_id)
 

@@ -5,12 +5,13 @@ from typing import Any
 
 import pandas as pd
 
+from .database import now_ts
 from .repository import list_devices, list_oobs, save_device
 
 IMPORT_FIELDS = [
     "oob_name", "hostname", "device_type", "vendor", "model", "serial",
     "mgmt_ip", "site", "rack", "u_position", "expected_line",
-    "expected_alias", "notes",
+    "expected_alias", "source", "source_id", "last_imported_at", "notes",
 ]
 
 
@@ -143,6 +144,9 @@ def preview_inventory_import(frame: pd.DataFrame) -> ImportPreview:
             "u_position": _clean(src.get("u_position")),
             "expected_line": line_value,
             "expected_alias": alias_value,
+            "source": _clean(src.get("source")),
+            "source_id": _clean(src.get("source_id")),
+            "last_imported_at": _clean(src.get("last_imported_at")),
             "notes": _clean(src.get("notes")),
         }
 
@@ -150,7 +154,8 @@ def preview_inventory_import(frame: pd.DataFrame) -> ImportPreview:
             changed_fields = []
             for field in (
                 "device_type", "vendor", "model", "serial", "mgmt_ip", "site",
-                "rack", "u_position", "expected_line", "expected_alias", "notes",
+                "rack", "u_position", "expected_line", "expected_alias",
+                "source", "source_id", "last_imported_at", "notes",
             ):
                 old_val = old.get(field)
                 new_val = normalized.get(field)
@@ -195,6 +200,9 @@ def apply_inventory_import(rows: list[dict[str, Any]], *, allow_updates: bool) -
             u_position=row.get("u_position", ""),
             expected_line=row.get("expected_line"),
             expected_alias=row.get("expected_alias", ""),
+            source=row.get("source", ""),
+            source_id=row.get("source_id", ""),
+            last_imported_at=row.get("last_imported_at") or now_ts(),
             notes=row.get("notes", ""),
         )
         if action == "UPDATE":

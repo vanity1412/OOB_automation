@@ -4,7 +4,7 @@
 |---|---|---|
 | 1 | Multi-OOB inventory | Done |
 | 2 | Cisco IOS/IOS-XE profile | Done |
-| 3 | Viettix configurable profile | Done |
+| 3 | Unsupported vendor profile scaffolds removed | Done |
 | 4 | Password không ghi DB/log/disk | Done |
 | 5 | Clear password khỏi Streamlit state sau connect attempt | Done |
 | 6 | Scrub Netmiko password/secret sau authentication | Done |
@@ -59,8 +59,15 @@
 | 55 | Verified inventory schema foundation | Done |
 | 56 | Context-aware terminal schema foundation | Done |
 | 57 | Session health schema foundation | Done |
-| 58 | Vertiv/Opengear/Raritan disabled vendor profile scaffolds | Done |
+| 58 | Direct hostname lookup in Devices | Done |
+| 69 | Vertiv/Avocent ACS800/ACS8000 REST API read-only scan | Done |
 | 59 | Safe automation guardrail foundation | Done |
 | 60 | Audit ticket_ref/note foundation | Done |
 | 61 | Console + power mapping schema foundation | Done |
 | 62 | Disaster readiness check schema foundation | Done |
+| 63 | Alias-missing / unverified-line / unknown-line alerts | Done |
+| 64 | Operator line assignment with ticket/confidence/evidence | Done |
+| 65 | Automatic session health classification | Done |
+| 66 | Inventory source/source_id/last_imported_at tracking | Done |
+| 67 | CSV/Excel import template support | Done |
+| 68 | Manual-only Power PDU mapping CRUD | Done |
