@@ -14,6 +14,10 @@ DATA_DIR = BASE_DIR / "data"
 DB_PATH = Path(os.environ.get("OOB_DB_PATH", str(DATA_DIR / "oob_manager.db")))
 
 
+def now_ts() -> str:
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
 @contextmanager
 def db() -> Iterator[sqlite3.Connection]:
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -179,6 +183,72 @@ def init_db() -> None:
                 updated_at TEXT DEFAULT CURRENT_TIMESTAMP
             );
 
+            CREATE TABLE IF NOT EXISTS terminal_contexts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                oob_id INTEGER NOT NULL,
+                device_id INTEGER,
+                line_no INTEGER,
+                context_state TEXT NOT NULL DEFAULT 'UNKNOWN',
+                prompt TEXT DEFAULT '',
+                privilege_level TEXT DEFAULT '',
+                confidence REAL DEFAULT 0,
+                source TEXT DEFAULT '',
+                detected_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(oob_id) REFERENCES oob_nodes(id) ON DELETE CASCADE,
+                FOREIGN KEY(device_id) REFERENCES devices(id) ON DELETE SET NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS console_power_map (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                oob_id INTEGER NOT NULL,
+                device_id INTEGER,
+                line_no INTEGER,
+                pdu_name TEXT DEFAULT '',
+                pdu_host TEXT DEFAULT '',
+                outlet_label TEXT DEFAULT '',
+                control_mode TEXT DEFAULT 'MANUAL',
+                verified_at TEXT,
+                notes TEXT DEFAULT '',
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(oob_id) REFERENCES oob_nodes(id) ON DELETE CASCADE,
+                FOREIGN KEY(device_id) REFERENCES devices(id) ON DELETE SET NULL,
+                UNIQUE(oob_id, line_no, pdu_name, outlet_label)
+            );
+
+            CREATE TABLE IF NOT EXISTS readiness_checks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                oob_id INTEGER,
+                device_id INTEGER,
+                line_no INTEGER,
+                check_type TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'PLANNED',
+                message TEXT DEFAULT '',
+                evidence TEXT DEFAULT '',
+                checked_at TEXT,
+                next_check_at TEXT,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(oob_id) REFERENCES oob_nodes(id) ON DELETE CASCADE,
+                FOREIGN KEY(device_id) REFERENCES devices(id) ON DELETE SET NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS safe_automation_runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                oob_id INTEGER,
+                device_id INTEGER,
+                line_no INTEGER,
+                target_context TEXT NOT NULL DEFAULT 'UNKNOWN',
+                guard_status TEXT NOT NULL DEFAULT 'PLANNED',
+                command_scope TEXT DEFAULT 'SHOW_ONLY',
+                command_count INTEGER DEFAULT 0,
+                ticket_ref TEXT DEFAULT '',
+                status TEXT DEFAULT 'PLANNED',
+                message TEXT DEFAULT '',
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(oob_id) REFERENCES oob_nodes(id) ON DELETE SET NULL,
+                FOREIGN KEY(device_id) REFERENCES devices(id) ON DELETE SET NULL
+            );
+
             CREATE INDEX IF NOT EXISTS idx_snapshots_oob_line_time
             ON console_snapshots(oob_id, line_no, captured_at);
 
@@ -187,10 +257,32 @@ def init_db() -> None:
 
             CREATE INDEX IF NOT EXISTS idx_scan_issues_scan
             ON scan_issues(scan_id, severity);
+
+            CREATE INDEX IF NOT EXISTS idx_terminal_contexts_target
+            ON terminal_contexts(oob_id, line_no, detected_at);
+
+            CREATE INDEX IF NOT EXISTS idx_readiness_checks_time
+            ON readiness_checks(status, next_check_at, checked_at);
+
+            CREATE INDEX IF NOT EXISTS idx_safe_automation_time
+            ON safe_automation_runs(guard_status, created_at);
             """
         )
 
         # Safe migrations from previous builds.
+        _ensure_column(conn, "devices", "verification_status", "TEXT DEFAULT 'UNVERIFIED'")
+        _ensure_column(conn, "devices", "verification_source", "TEXT DEFAULT ''")
+        _ensure_column(conn, "devices", "verified_hostname", "TEXT DEFAULT ''")
+        _ensure_column(conn, "devices", "verified_serial", "TEXT DEFAULT ''")
+        _ensure_column(conn, "devices", "verified_model", "TEXT DEFAULT ''")
+        _ensure_column(conn, "devices", "verified_at", "TEXT DEFAULT ''")
+        _ensure_column(conn, "devices", "verified_by", "TEXT DEFAULT ''")
+        _ensure_column(conn, "devices", "verification_note", "TEXT DEFAULT ''")
+        _ensure_column(conn, "detected_console", "session_health", "TEXT DEFAULT 'UNKNOWN'")
+        _ensure_column(conn, "detected_console", "health_reason", "TEXT DEFAULT ''")
+        _ensure_column(conn, "detected_console", "prompt_context", "TEXT DEFAULT 'UNKNOWN'")
+        _ensure_column(conn, "detected_console", "context_confidence", "REAL DEFAULT 0")
+        _ensure_column(conn, "detected_console", "last_output_at", "TEXT DEFAULT ''")
         _ensure_column(conn, "scans", "parse_status", "TEXT DEFAULT 'UNKNOWN'")
         _ensure_column(conn, "scans", "parse_quality", "REAL DEFAULT 0")
         _ensure_column(conn, "change_events", "last_seen", "TEXT DEFAULT ''")
@@ -198,9 +290,12 @@ def init_db() -> None:
         _ensure_column(conn, "change_events", "occurrence_count", "INTEGER NOT NULL DEFAULT 1")
         _ensure_column(conn, "change_events", "acknowledged_by", "TEXT DEFAULT ''")
         _ensure_column(conn, "change_events", "resolved_by", "TEXT DEFAULT ''")
+        _ensure_column(conn, "change_events", "ticket_ref", "TEXT DEFAULT ''")
         _ensure_column(conn, "audit", "actor", "TEXT DEFAULT ''")
         _ensure_column(conn, "audit", "source_host", "TEXT DEFAULT ''")
         _ensure_column(conn, "audit", "source_ip", "TEXT DEFAULT ''")
+        _ensure_column(conn, "audit", "ticket_ref", "TEXT DEFAULT ''")
+        _ensure_column(conn, "audit", "note", "TEXT DEFAULT ''")
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_change_events_status ON change_events(status,severity,last_seen)"
         )
@@ -240,6 +335,8 @@ def audit(
     oob_id: int | None = None,
     device_id: int | None = None,
     detail: str = "",
+    ticket_ref: str = "",
+    note: str = "",
     actor: str | None = None,
     source_host: str | None = None,
     source_ip: str | None = None,
@@ -252,12 +349,15 @@ def audit(
     with db() as conn:
         conn.execute(
             """
-            INSERT INTO audit(actor,source_host,source_ip,action,oob_id,device_id,detail)
-            VALUES(?,?,?,?,?,?,?)
+            INSERT INTO audit(
+                ts,actor,source_host,source_ip,action,oob_id,device_id,detail,ticket_ref,note
+            )
+            VALUES(?,?,?,?,?,?,?,?,?,?)
             """,
             (
+                now_ts(),
                 actor[:128], source_host[:255], source_ip[:64], action,
-                oob_id, device_id, detail[:1000],
+                oob_id, device_id, detail[:1000], ticket_ref.strip()[:128], note.strip()[:1000],
             ),
         )
 

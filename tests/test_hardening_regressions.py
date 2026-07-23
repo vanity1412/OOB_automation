@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import sqlite3
+import sys
 import tempfile
 from pathlib import Path
 
@@ -12,6 +13,9 @@ except ModuleNotFoundError:
 
 TEST_ROOT = Path(tempfile.mkdtemp(prefix="oob_hardening_"))
 os.environ["OOB_DB_PATH"] = str(TEST_ROOT / "oob_test.db")
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 from core.database import DB_PATH, backup_db, init_db
 from core.discovery import preserve_previous_mapping

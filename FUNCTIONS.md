@@ -52,3 +52,15 @@
 | 48 | Scheduled Windows daily backup | Done |
 | 49 | Backup retention | Done |
 | 50 | GUI bind localhost by default | Done |
+| 51 | Data analytics time filter 24h/7d/30d/90d/custom | Done |
+| 52 | Daily scan/snapshot/alert/parse-quality summary | Done |
+| 53 | Scan volume / accepted-rejected / severity / open-resolved / parse quality charts | Done |
+| 54 | Recent scan/issues/events/audit detail tabs | Done |
+| 55 | Verified inventory schema foundation | Done |
+| 56 | Context-aware terminal schema foundation | Done |
+| 57 | Session health schema foundation | Done |
+| 58 | Vertiv/Opengear/Raritan disabled vendor profile scaffolds | Done |
+| 59 | Safe automation guardrail foundation | Done |
+| 60 | Audit ticket_ref/note foundation | Done |
+| 61 | Console + power mapping schema foundation | Done |
+| 62 | Disaster readiness check schema foundation | Done |
