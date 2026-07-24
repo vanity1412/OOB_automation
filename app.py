@@ -680,9 +680,6 @@ VALUE_TONES = {
     "TARGET": "green",
     "LIVE DB": "green",
     "DEMO DB": "amber",
-    "IP_READY": "green",
-    "IP_ONLY": "amber",
-    "MISSING_IP": "red",
     "UNKNOWN": "slate",
 }
 
@@ -903,20 +900,6 @@ def count_rows(frame: pd.DataFrame, column: str) -> list[tuple[str, int]]:
     return [(str(label), int(count)) for label, count in counts.items()]
 
 
-def ip_coverage_rows(frame: pd.DataFrame) -> list[tuple[str, int]]:
-    if frame.empty:
-        return []
-    ip_series = frame["IP"] if "IP" in frame.columns else pd.Series("", index=frame.index)
-    port_series = frame["TCP Port"] if "TCP Port" in frame.columns else pd.Series("", index=frame.index)
-    has_ip = ip_series.apply(has_value)
-    has_port = port_series.apply(has_value)
-    return [
-        ("IP_READY", int((has_ip & has_port).sum())),
-        ("IP_ONLY", int((has_ip & ~has_port).sum())),
-        ("MISSING_IP", int((~has_ip).sum())),
-    ]
-
-
 def active_db_label() -> tuple[str, str, str]:
     try:
         db_display = str(DB_PATH.resolve().relative_to(APP_ROOT))
@@ -1051,7 +1034,7 @@ def as_port(value: object) -> int:
 
 
 def console_telnet_command(row: dict[str, object] | pd.Series) -> str:
-    console_ip = row.get("IP") or row.get("OOB Host")
+    console_ip = row.get("Target") or row.get("IP")
     if has_value(row.get("TCP Port")) and has_value(console_ip):
         return f"telnet {console_ip} {as_port(row['TCP Port'])}"
     return ""
@@ -1064,7 +1047,7 @@ def clear_line_command(row: dict[str, object] | pd.Series) -> str:
 
 
 def display_ip(row: dict[str, object] | pd.Series) -> str:
-    for col in ("Target", "IP", "Mgmt IP", "OOB Host"):
+    for col in ("Target", "IP"):
         value = row.get(col)
         if has_value(value):
             return str(value).strip()
@@ -1170,14 +1153,14 @@ DEVICE_COLUMN_CONFIG = {
     "Line": st.column_config.NumberColumn("Line", width="small"),
     "Device": st.column_config.TextColumn("Device", width="medium"),
     "Type": st.column_config.TextColumn("Type", width="small"),
-    "IP": st.column_config.TextColumn("IP", width="small"),
+    "IP": st.column_config.TextColumn("Telnet IP", width="small"),
     "Alias": st.column_config.TextColumn("Alias", width="medium"),
     "TCP Port": st.column_config.NumberColumn("TCP Port", width="small"),
-    "Status": st.column_config.TextColumn("Status", width="small"),
+    "Status": st.column_config.TextColumn("Console Status", width="small"),
     "Session": st.column_config.TextColumn("Session", width="small"),
-    "Health": st.column_config.TextColumn("Health", width="small"),
+    "Health": st.column_config.TextColumn("Session Health", width="small"),
     "Mapping": st.column_config.TextColumn("Mapping", width="medium"),
-    "Risk": st.column_config.TextColumn("Risk", width="medium"),
+    "Risk": st.column_config.TextColumn("Troubleshooting Risk", width="medium"),
     "Severity": st.column_config.TextColumn("Severity", width="small"),
     "Verification": st.column_config.TextColumn("Verification", width="medium"),
     "Last Seen": st.column_config.TextColumn("Last Seen", width="medium"),
@@ -1195,6 +1178,14 @@ if "live" not in st.session_state:
     st.session_state.live = LiveOOB()
 if "last_scan" not in st.session_state:
     st.session_state.last_scan = None
+if "auto_scan_enabled" not in st.session_state:
+    st.session_state.auto_scan_enabled = False
+if "auto_scan_interval_minutes" not in st.session_state:
+    st.session_state.auto_scan_interval_minutes = 5
+if "auto_scan_last_finished_at" not in st.session_state:
+    st.session_state.auto_scan_last_finished_at = ""
+if "auto_scan_message" not in st.session_state:
+    st.session_state.auto_scan_message = ""
 if "device_edit_id" not in st.session_state:
     st.session_state.device_edit_id = None
 if "oob_edit_id" not in st.session_state:
@@ -1271,6 +1262,81 @@ with st.sidebar:
         ),
         unsafe_allow_html=True,
     )
+    if live.connected:
+        st.checkbox(
+            "Auto scan active OOB",
+            key="auto_scan_enabled",
+            help=(
+                "Tự scan lại phiên OOB đang connected theo chu kỳ. "
+                "Password không được lưu; auto scan dừng khi disconnect."
+            ),
+        )
+        st.selectbox(
+            "Auto scan interval",
+            [1, 5, 10, 15, 30, 60],
+            key="auto_scan_interval_minutes",
+            format_func=lambda minutes: f"{minutes} phút",
+            disabled=not st.session_state.auto_scan_enabled,
+        )
+        if st.session_state.auto_scan_message:
+            st.caption(st.session_state.auto_scan_message)
+    else:
+        st.session_state.auto_scan_enabled = False
+
+
+@st.fragment(run_every=60)
+def auto_scan_active_oob() -> None:
+    if not bool(st.session_state.get("auto_scan_enabled", False)):
+        return
+    live_session: LiveOOB = st.session_state.live
+    if not live_session.connected or live_session.oob_id is None:
+        st.session_state.auto_scan_message = "Auto scan paused: no active OOB session."
+        return
+
+    try:
+        interval_minutes = int(st.session_state.get("auto_scan_interval_minutes", 5))
+    except (TypeError, ValueError):
+        interval_minutes = 5
+    interval_minutes = max(1, min(interval_minutes, 60))
+
+    now = datetime.now()
+    last_text = str(st.session_state.get("auto_scan_last_finished_at") or "")
+    if last_text:
+        try:
+            last_finished = datetime.fromisoformat(last_text)
+        except ValueError:
+            last_finished = None
+        if last_finished and now - last_finished < timedelta(minutes=interval_minutes):
+            return
+
+    st.session_state.auto_scan_last_finished_at = now.isoformat(timespec="seconds")
+    try:
+        result = scan(live_session, int(live_session.oob_id), live_session.profile_key)
+        finished = datetime.now()
+        st.session_state.last_scan = result
+        st.session_state.last_scan_oob_id = int(live_session.oob_id)
+        st.session_state.auto_scan_last_finished_at = finished.isoformat(timespec="seconds")
+        state = "accepted" if result["accepted"] else "rejected"
+        st.session_state.auto_scan_message = (
+            f"Auto scan {finished.strftime('%H:%M:%S')} · {state} · "
+            f"{len(result['records'])} lines · {result['change_count']} alerts."
+        )
+        audit(
+            "auto_scan",
+            oob_id=int(live_session.oob_id),
+            detail=(
+                f"accepted={result['accepted']}; rows={len(result['records'])}; "
+                f"events={result['change_count']}; quality={result['parse_quality']:.2f}"
+            ),
+        )
+        st.rerun()
+    except ScanBusyError as exc:
+        st.session_state.auto_scan_message = f"Auto scan skipped: {exc}"
+    except Exception as exc:
+        st.session_state.auto_scan_message = f"Auto scan failed: {type(exc).__name__}: {exc}"
+
+
+auto_scan_active_oob()
 
 # ---------- Header ----------
 left, right = st.columns([4, 1.3])
@@ -1344,12 +1410,10 @@ if active_page == "Devices":
     render_kpi(m5, "Risk Review", risk_attention, "amber" if risk_attention else "green", "troubleshooting")
     render_kpi(m6, "Open Alerts", open_alerts, "red" if open_alerts else "green", "needs attention")
 
-    chart1, chart2 = st.columns(2)
+    chart1, chart2, chart3 = st.columns(3)
     render_bar_chart(chart1, "Console Status", count_rows(df, "Status"))
     render_bar_chart(chart2, "Troubleshooting Risk", count_rows(df, "Risk"))
-    chart3, chart4 = st.columns(2)
     render_bar_chart(chart3, "Session Health", count_rows(df, "Health"))
-    render_bar_chart(chart4, "IP / Telnet Coverage", ip_coverage_rows(df))
 
     st.write("**Quick Hostname Lookup**")
     hostname_lookup = st.text_input(
@@ -1643,7 +1707,7 @@ if active_page == "Devices":
                     except Exception as exc:
                         st.error(str(exc))
 
-            console_ip = row.get("IP") or row.get("OOB Host")
+            console_ip = row.get("Target") or row.get("IP")
             if has_value(row["TCP Port"]) and has_value(console_ip):
                 tcp_port = as_port(row["TCP Port"])
                 row_line_no = int(float(str(row["Line"]).strip())) if has_value(row["Line"]) else None
@@ -2859,6 +2923,7 @@ if active_page == "Discovery":
 
                         st.session_state.last_scan = result
                         st.session_state.last_scan_oob_id = target["id"]
+                        st.session_state.auto_scan_last_finished_at = datetime.now().isoformat(timespec="seconds")
                         audit(
                             "scan",
                             oob_id=target["id"],

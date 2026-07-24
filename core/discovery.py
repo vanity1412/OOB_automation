@@ -187,12 +187,26 @@ def parse_generic_host_mappings(text: str, base: int) -> list[PortRecord]:
 def parse_lines(text: str) -> dict[int, dict[str, str]]:
     rows: dict[int, dict[str, str]] = {}
     for raw in (text or "").splitlines():
-        m = re.match(r"^\s*(\*)?\s*(\d+)\s+(.+)$", raw)
-        if not m:
+        stripped = raw.strip()
+        if not stripped:
             continue
-        active = bool(m.group(1))
-        line_no = int(m.group(2))
-        rest = m.group(3).strip()
+        active = stripped.startswith("*")
+        if active:
+            stripped = stripped[1:].strip()
+        tokens = stripped.split()
+        if not tokens:
+            continue
+
+        line_no = None
+        if re.fullmatch(r"\d+(?:/\d+)+", tokens[0]) and len(tokens) > 1 and tokens[1].isdigit():
+            line_no = int(tokens[1])
+            rest = " ".join(tokens[2:])
+        elif tokens[0].isdigit():
+            line_no = int(tokens[0])
+            rest = " ".join(tokens[1:])
+        else:
+            continue
+
         low = rest.lower()
         state = "BUSY" if active else "AVAILABLE"
         busy_words = ("active", "connected", "in use", "busy")
