@@ -9,3 +9,5 @@ data/*.pid
 data/*.jobid
 data/backups/
 streamlit.*.log
+.streamlit_logs/
+streamlit-server*.log

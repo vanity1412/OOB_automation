@@ -93,7 +93,7 @@ def scan(session, oob_id: int, profile_key: str, *, acquire_lock: bool = True) -
             if profile.get("vendor") == "cisco":
                 host_records = parse_cisco_hosts(host_text, base)
                 if not host_records:
-                    menu_records = parse_cisco_menu(menu_text)
+                    menu_records = parse_cisco_menu(menu_text, base)
                     if menu_records:
                         host_records = menu_records
                         mapping_text = menu_text

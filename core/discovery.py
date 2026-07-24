@@ -72,7 +72,7 @@ def parse_cisco_hosts(text: str, base: int) -> list[PortRecord]:
     return out
 
 
-def parse_cisco_menu(text: str) -> list[PortRecord]:
+def parse_cisco_menu(text: str, base: int = 2000) -> list[PortRecord]:
     out: list[PortRecord] = []
     if not (text or "").strip():
         return out
@@ -127,14 +127,15 @@ def parse_cisco_menu(text: str) -> list[PortRecord]:
         alias = str(entry.get("alias") or f"{best_menu}-{item}").strip()
         target_host = str(entry.get("target_host") or "").strip()
         tcp_port = int(entry["tcp_port"])
+        line_no = port_to_line(tcp_port, base) or item
         out.append(
             PortRecord(
-                line_no=item,
+                line_no=line_no,
                 alias=alias,
                 tcp_port=tcp_port,
                 target_host=target_host,
                 raw_line=(
-                    f"menu {best_menu} item {item}: {alias} -> "
+                    f"menu {best_menu} item {item}; line {line_no}: {alias} -> "
                     f"telnet {target_host} {tcp_port}"
                 ),
             )

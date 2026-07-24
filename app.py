@@ -12,7 +12,7 @@ import streamlit as st
 from netmiko.exceptions import NetmikoAuthenticationException, NetmikoTimeoutException
 
 from core.connection import LiveOOB, clear_console_line
-from core.database import audit, backup_db, init_db, prune_backups
+from core.database import DB_PATH, audit, backup_db, init_db, prune_backups
 from core.importer import IMPORT_FIELDS, apply_inventory_import, preview_inventory_import
 from core.profiles import list_profiles, load_profile
 from core.repository import (
@@ -33,6 +33,7 @@ from core.repository import (
     list_console_power_map,
     list_devices,
     list_oobs,
+    list_scans,
     list_readiness_checks,
     list_scan_issues_range,
     list_scans_range,
@@ -87,7 +88,8 @@ _flash_success = st.session_state.pop("_flash_success", None)
 _flash_error = st.session_state.pop("_flash_error", None)
 _flash_warning = st.session_state.pop("_flash_warning", None)
 
-FPT_LOGO_PATH = Path(__file__).resolve().parent / "assets" / "fpt_telecom_logo.jpg"
+APP_ROOT = Path(__file__).resolve().parent
+FPT_LOGO_PATH = APP_ROOT / "assets" / "fpt_telecom_logo.jpg"
 
 
 def image_data_uri(path: Path) -> str:
@@ -676,6 +678,11 @@ VALUE_TONES = {
     "EXPECTED_DEVICE_NOT_DETECTED": "red",
     "OOB": "blue",
     "TARGET": "green",
+    "LIVE DB": "green",
+    "DEMO DB": "amber",
+    "IP_READY": "green",
+    "IP_ONLY": "amber",
+    "MISSING_IP": "red",
     "UNKNOWN": "slate",
 }
 
@@ -752,6 +759,7 @@ def render_bar_chart(
             st.caption("No data")
         else:
             max_count = max(1, int(frame["count"].max()))
+            axis_values = list(range(max_count + 1)) if max_count <= 20 else None
             chart = (
                 alt.Chart(frame)
                 .mark_bar(cornerRadiusTopLeft=4, cornerRadiusTopRight=4)
@@ -761,7 +769,7 @@ def render_bar_chart(
                         "count:Q",
                         title=None,
                         scale=alt.Scale(domain=[0, max_count]),
-                        axis=alt.Axis(values=list(range(max_count + 1)), format="d"),
+                        axis=alt.Axis(values=axis_values, format="d"),
                     ),
                     color=alt.Color("color:N", scale=None, legend=None),
                     tooltip=[
@@ -893,6 +901,29 @@ def count_rows(frame: pd.DataFrame, column: str) -> list[tuple[str, int]]:
         .value_counts()
     )
     return [(str(label), int(count)) for label, count in counts.items()]
+
+
+def ip_coverage_rows(frame: pd.DataFrame) -> list[tuple[str, int]]:
+    if frame.empty:
+        return []
+    ip_series = frame["IP"] if "IP" in frame.columns else pd.Series("", index=frame.index)
+    port_series = frame["TCP Port"] if "TCP Port" in frame.columns else pd.Series("", index=frame.index)
+    has_ip = ip_series.apply(has_value)
+    has_port = port_series.apply(has_value)
+    return [
+        ("IP_READY", int((has_ip & has_port).sum())),
+        ("IP_ONLY", int((has_ip & ~has_port).sum())),
+        ("MISSING_IP", int((~has_ip).sum())),
+    ]
+
+
+def active_db_label() -> tuple[str, str, str]:
+    try:
+        db_display = str(DB_PATH.resolve().relative_to(APP_ROOT))
+    except ValueError:
+        db_display = str(DB_PATH)
+    is_demo = "demo" in DB_PATH.name.lower()
+    return ("Demo DB" if is_demo else "Live DB", "amber" if is_demo else "green", db_display)
 
 
 def cell_style(value: object) -> str:
@@ -1135,16 +1166,16 @@ def row_risk(
 
 
 DEVICE_COLUMN_CONFIG = {
-    "OOB": st.column_config.TextColumn("OOB", width="medium"),
+    "OOB": st.column_config.TextColumn("OOB", width="small"),
     "Line": st.column_config.NumberColumn("Line", width="small"),
     "Device": st.column_config.TextColumn("Device", width="medium"),
     "Type": st.column_config.TextColumn("Type", width="small"),
-    "IP": st.column_config.TextColumn("IP", width="medium"),
+    "IP": st.column_config.TextColumn("IP", width="small"),
     "Alias": st.column_config.TextColumn("Alias", width="medium"),
     "TCP Port": st.column_config.NumberColumn("TCP Port", width="small"),
     "Status": st.column_config.TextColumn("Status", width="small"),
     "Session": st.column_config.TextColumn("Session", width="small"),
-    "Health": st.column_config.TextColumn("Health", width="medium"),
+    "Health": st.column_config.TextColumn("Health", width="small"),
     "Mapping": st.column_config.TextColumn("Mapping", width="medium"),
     "Risk": st.column_config.TextColumn("Risk", width="medium"),
     "Severity": st.column_config.TextColumn("Severity", width="small"),
@@ -1174,6 +1205,9 @@ if "power_map_edit_id" not in st.session_state:
 live: LiveOOB = st.session_state.live
 profiles = list_profiles()
 oobs = list_oobs()
+db_label, db_tone, db_display = active_db_label()
+latest_scans = list_scans(limit=1)
+latest_scan = latest_scans[0] if latest_scans else None
 
 header_alerts = count_open_events()
 header_open_alerts = sum(header_alerts.values())
@@ -1206,22 +1240,34 @@ with st.sidebar:
     live_label = f"Connected: {live.name}" if live.connected else "Disconnected"
     live_dot = "#16a34a" if live.connected else "#64748b"
     alert_style = "color:#dc2626;" if header_open_alerts else "color:#16a34a;"
+    db_style = "color:#d97706;" if db_label == "Demo DB" else "color:#16a34a;"
+    last_scan_label = (
+        f"{latest_scan['parse_status']} · {latest_scan['line_count']} lines"
+        if latest_scan else "No scan yet"
+    )
     st.markdown(
         "<div class='sidebar-stats-card'>"
         "<div class='sidebar-status' style='--sidebar-dot:{live_dot};'>"
         "<span class='sidebar-dot'></span><span>{live_label}</span></div>"
+        "<div class='sidebar-stat-row'><span class='sidebar-stat-label'>Data</span>"
+        "<span class='sidebar-stat-value' style='{db_style}'>{db_label}</span></div>"
         "<div class='sidebar-stat-row'><span class='sidebar-stat-label'>OOB Nodes</span>"
         "<span class='sidebar-stat-value'>{oob_count}</span></div>"
         "<div class='sidebar-stat-row'><span class='sidebar-stat-label'>Open Alerts</span>"
         "<span class='sidebar-stat-value' style='{alert_style}'>{alert_count}</span></div>"
+        "<div class='sidebar-stat-row'><span class='sidebar-stat-label'>Last Scan</span>"
+        "<span class='sidebar-stat-value'>{last_scan_label}</span></div>"
         "<div class='sidebar-stat-row'><span class='sidebar-stat-label'>Scan Mode</span>"
         "<span class='sidebar-stat-value'>Serial lock</span></div>"
         "</div>".format(
             live_dot=live_dot,
             live_label=html.escape(live_label),
+            db_label=html.escape(db_label),
+            db_style=db_style,
             oob_count=len(oobs),
             alert_count=header_open_alerts,
             alert_style=alert_style,
+            last_scan_label=html.escape(last_scan_label),
         ),
         unsafe_allow_html=True,
     )
@@ -1244,6 +1290,7 @@ with right:
 render_status_strip(
     [
         ("Local GUI", "blue"),
+        (f"{db_label} · {db_display}", db_tone),
         (
             f"{len(oobs)} OOB node" + ("" if len(oobs) == 1 else "s"),
             "blue" if oobs else "slate",
@@ -1256,6 +1303,12 @@ render_status_strip(
         ("No saved passwords", "slate"),
     ]
 )
+
+if db_label == "Demo DB":
+    st.warning(
+        "Đang mở database demo. Scan thiết bị thật sẽ không hiện đúng ở màn này nếu server vẫn chạy với demo DB. "
+        "Hãy mở app bằng Live DB để dùng dữ liệu production."
+    )
 
 # ==============================================================
 # DEVICES
@@ -1291,10 +1344,12 @@ if active_page == "Devices":
     render_kpi(m5, "Risk Review", risk_attention, "amber" if risk_attention else "green", "troubleshooting")
     render_kpi(m6, "Open Alerts", open_alerts, "red" if open_alerts else "green", "needs attention")
 
-    if not df.empty:
-        chart1, chart2 = st.columns(2)
-        render_bar_chart(chart1, "Console Status", count_rows(df, "Status"))
-        render_bar_chart(chart2, "Troubleshooting Risk", count_rows(df, "Risk"))
+    chart1, chart2 = st.columns(2)
+    render_bar_chart(chart1, "Console Status", count_rows(df, "Status"))
+    render_bar_chart(chart2, "Troubleshooting Risk", count_rows(df, "Risk"))
+    chart3, chart4 = st.columns(2)
+    render_bar_chart(chart3, "Session Health", count_rows(df, "Health"))
+    render_bar_chart(chart4, "IP / Telnet Coverage", ip_coverage_rows(df))
 
     st.write("**Quick Hostname Lookup**")
     hostname_lookup = st.text_input(
@@ -1406,7 +1461,7 @@ if active_page == "Devices":
             shown = shown[shown["OOB"] == oob_filter]
 
     table_cols = [
-        "OOB","Line","Device","IP","TCP Port","Status","Risk"
+        "Device","IP","Line","TCP Port","Status","Health","Risk","OOB"
     ]
 
     if shown.empty:

@@ -39,10 +39,11 @@ def run():
         "menu cisco clear-screen"
     )
     menu_hosts = parse_cisco_menu(menu_output)
-    assert [row.line_no for row in menu_hosts] == [1, 4]
+    assert [row.line_no for row in menu_hosts] == [3, 6]
     assert menu_hosts[0].alias == "HCM-CDNLeaf-Quan9-10G-01"
     assert menu_hosts[0].target_host == "172.28.200.11"
     assert menu_hosts[0].tcp_port == 2003
+    assert "item 1" in menu_hosts[0].raw_line
     assert menu_hosts[1].alias == "HCM-CDNLeaf-Quan9-10G-04"
     assert menu_hosts[1].tcp_port == 2006
 
