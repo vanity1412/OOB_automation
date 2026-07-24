@@ -28,6 +28,7 @@
   "notes": "Cisco terminal-server profile.",
   "mapping_supported": true,
   "min_line_retention_ratio": 0.6,
+  "menu_line_state_min_overlap": 0.5,
   "command_timeout": 15,
   "connect_timeout": 8,
   "connect_retries": 2

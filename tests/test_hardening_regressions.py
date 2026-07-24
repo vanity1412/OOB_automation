@@ -18,10 +18,17 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from core.database import DB_PATH, backup_db, init_db
+from core.connection import _clear_line_command
 from core.discovery import preserve_previous_mapping
 from core.repository import save_device, save_oob
 from core.scanner import first_working
-from core.terminal import _securecrt_ssh_args, _securecrt_telnet_args, _ssh_args, _telnet_args
+from core.terminal import (
+    _securecrt_ssh_args,
+    _securecrt_telnet_args,
+    _ssh_args,
+    _telnet_args,
+    check_tcp_reachable,
+)
 
 if pd is not None:
     from core.importer import preview_inventory_import
@@ -94,6 +101,17 @@ def test_ssh_args_are_validated() -> None:
     expect_raises(lambda: _ssh_args("10.0.0.1", 22, "-oProxyCommand=calc"), "Invalid SSH username")
     expect_raises(lambda: _ssh_args("10.0.0.1", 70000, "admin"), "Invalid SSH port")
     expect_raises(lambda: _telnet_args("bad host", 23), "Invalid telnet host")
+    expect_raises(lambda: check_tcp_reachable("bad host", 2003), "Invalid console host")
+    expect_raises(
+        lambda: check_tcp_reachable("bad host", 2003, attempts=4),
+        "Invalid console host",
+    )
+
+
+def test_clear_line_command_is_validated() -> None:
+    assert _clear_line_command(14) == "clear line 14"
+    expect_raises(lambda: _clear_line_command(-1), "between 0 and 9999")
+    expect_raises(lambda: _clear_line_command(10000), "between 0 and 9999")
 
 
 def test_inventory_uniqueness_and_import_preview() -> None:
@@ -200,6 +218,7 @@ def run() -> None:
     test_first_working_skips_cli_error()
     test_preserve_previous_mapping_overrides_untrusted_alias()
     test_ssh_args_are_validated()
+    test_clear_line_command_is_validated()
     test_inventory_uniqueness_and_import_preview()
     test_backup_contains_latest_committed_data()
     print("hardening regression tests: OK")

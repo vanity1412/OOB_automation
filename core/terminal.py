@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import os
 import re
+import socket
 import subprocess
+import time
 
 SAFE_HOST_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,252}$")
 SAFE_USER_RE = re.compile(r"^[A-Za-z0-9_.][A-Za-z0-9_.@\\-]{0,127}$")
@@ -36,6 +38,42 @@ def _ssh_args(host: str, port: int, username: str) -> list[str]:
 def _telnet_args(host: str, port: int) -> list[str]:
     safe_host, safe_port = _validate_host_port(host, port, "telnet")
     return ["telnet", safe_host, str(safe_port)]
+
+
+def check_tcp_reachable(
+    host: str,
+    port: int,
+    timeout: float = 3.0,
+    *,
+    attempts: int = 1,
+    delay: float = 1.0,
+) -> None:
+    safe_host, safe_port = _validate_host_port(host, port, "console")
+    attempts = max(1, min(int(attempts), 5))
+    last_exc: OSError | TimeoutError | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            with socket.create_connection((safe_host, safe_port), timeout=max(0.5, float(timeout))):
+                return
+        except (ConnectionRefusedError, TimeoutError, OSError) as exc:
+            last_exc = exc
+            if attempt < attempts:
+                time.sleep(max(0.1, float(delay)))
+
+    if isinstance(last_exc, ConnectionRefusedError):
+        raise RuntimeError(
+            f"Connection refused tới {safe_host}:{safe_port}. "
+            "Có thể line/session đang kẹt; hãy clear line rồi connect lại."
+        ) from last_exc
+    if isinstance(last_exc, TimeoutError):
+        raise RuntimeError(
+            f"Timeout tới {safe_host}:{safe_port}. "
+            "Kiểm tra route/ACL hoặc clear line rồi connect lại nếu OOB đang kẹt."
+        ) from last_exc
+    raise RuntimeError(
+        f"Không mở được console {safe_host}:{safe_port}: {last_exc}. "
+        "Có thể cần clear line rồi connect lại."
+    ) from last_exc
 
 
 def _securecrt_exe(path: str = "") -> str:

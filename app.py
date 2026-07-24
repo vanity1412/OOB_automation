@@ -11,7 +11,7 @@ import pandas as pd
 import streamlit as st
 from netmiko.exceptions import NetmikoAuthenticationException, NetmikoTimeoutException
 
-from core.connection import LiveOOB
+from core.connection import LiveOOB, clear_console_line
 from core.database import audit, backup_db, init_db, prune_backups
 from core.importer import IMPORT_FIELDS, apply_inventory_import, preview_inventory_import
 from core.profiles import list_profiles, load_profile
@@ -50,6 +50,7 @@ from core.repository import (
 from core.scan_lock import ScanBusyError, global_scan_lock
 from core.scanner import scan
 from core.terminal import (
+    check_tcp_reachable,
     launch_securecrt_ssh,
     launch_securecrt_telnet,
     launch_windows_ssh,
@@ -78,6 +79,9 @@ init_db()
 # after every connection attempt via a rerun; it is never written to SQLite/logs.
 if st.session_state.pop("_clear_disc_pass", False):
     st.session_state["disc_pass"] = ""
+for _secret_key in st.session_state.pop("_clear_secret_keys", []):
+    if _secret_key in st.session_state:
+        st.session_state[_secret_key] = ""
 
 _flash_success = st.session_state.pop("_flash_success", None)
 _flash_error = st.session_state.pop("_flash_error", None)
@@ -660,6 +664,16 @@ VALUE_TONES = {
     "BOOTLOADER_OR_ROMMON": "amber",
     "UNKNOWN_CONTEXT": "slate",
     "WRONG_BAUD": "red",
+    "OK": "green",
+    "LINE_CHANGED": "red",
+    "NOT_DETECTED": "red",
+    "EXPECTED_ALIAS_MISMATCH": "red",
+    "ALIAS_MISSING": "amber",
+    "UNVERIFIED_LINE": "amber",
+    "LINE_OCCUPIED_BY_UNKNOWN": "amber",
+    "NEW_CONSOLE_DEVICE": "amber",
+    "CONSOLE_MAPPING_CHANGED": "red",
+    "EXPECTED_DEVICE_NOT_DETECTED": "red",
     "OOB": "blue",
     "TARGET": "green",
     "UNKNOWN": "slate",
@@ -895,15 +909,31 @@ def cell_style(value: object) -> str:
 
 def row_tint(row: pd.Series) -> list[str]:
     mapping = str(row.get("Mapping", "") or "").upper()
+    risk = str(row.get("Risk", "") or "").upper()
+    row_severity = str(row.get("Severity", "") or "").upper()
     status = str(row.get("Status", "") or "").upper()
     verification = str(row.get("Verification", "") or "").upper()
     severity = str(row.get("severity", "") or "").upper()
     action = str(row.get("action", "") or "").upper()
 
     bg = ""
-    if mapping in {"MISMATCH", "NOT DETECTED"} or verification == "STALE" or severity in {"CRITICAL", "HIGH"}:
+    if (
+        mapping in {"MISMATCH", "NOT DETECTED"}
+        or risk in {"MISMATCH", "LINE_CHANGED", "NOT_DETECTED", "STALE_SESSION", "BOOTLOADER_OR_ROMMON"}
+        or verification == "STALE"
+        or row_severity in {"CRITICAL", "HIGH"}
+        or severity in {"CRITICAL", "HIGH"}
+    ):
         bg = "background-color:#fff5f5;"
-    elif mapping == "UNMANAGED" or verification == "UNVERIFIED" or status == "BUSY" or severity == "WARNING" or action == "UPDATE":
+    elif (
+        mapping == "UNMANAGED"
+        or risk not in {"", "OK"}
+        or verification == "UNVERIFIED"
+        or status == "BUSY"
+        or row_severity == "WARNING"
+        or severity == "WARNING"
+        or action == "UPDATE"
+    ):
         bg = "background-color:#fffbeb;"
     elif status == "AVAILABLE" or action == "ADD":
         bg = "background-color:#f0fdf4;"
@@ -963,7 +993,10 @@ def styled_table(frame: pd.DataFrame):
     )
     highlight_cols = [
         col
-        for col in ("Status", "Mapping", "Verification", "severity", "status", "state", "parse_status", "action")
+        for col in (
+            "Status", "Mapping", "Verification", "Risk", "Severity",
+            "severity", "status", "state", "parse_status", "action",
+        )
         if col in frame.columns
     ]
     for col in highlight_cols:
@@ -986,17 +1019,135 @@ def as_port(value: object) -> int:
     return int(float(str(value).strip()))
 
 
+def console_telnet_command(row: dict[str, object] | pd.Series) -> str:
+    console_ip = row.get("IP") or row.get("OOB Host")
+    if has_value(row.get("TCP Port")) and has_value(console_ip):
+        return f"telnet {console_ip} {as_port(row['TCP Port'])}"
+    return ""
+
+
+def clear_line_command(row: dict[str, object] | pd.Series) -> str:
+    if has_value(row.get("Line")):
+        return f"clear line {int(float(str(row['Line']).strip()))}"
+    return ""
+
+
+def display_ip(row: dict[str, object] | pd.Series) -> str:
+    for col in ("Target", "IP", "Mgmt IP", "OOB Host"):
+        value = row.get(col)
+        if has_value(value):
+            return str(value).strip()
+    return ""
+
+
+SEVERITY_ORDER = {"CRITICAL": 0, "HIGH": 1, "WARNING": 2, "INFO": 3, "": 9}
+RISKY_HEALTH = {
+    "STALE_SESSION": ("HIGH", "Line looks stale across scans; verify before using console."),
+    "BOOTLOADER_OR_ROMMON": ("HIGH", "Console output looks like bootloader/ROMMON context."),
+    "INCONSISTENT": ("HIGH", "Line state and parsed session user conflict."),
+    "NO_OUTPUT": ("WARNING", "No output was captured for this line."),
+    "BUSY_NO_USER": ("WARNING", "Line is busy but no session user was parsed."),
+    "UNKNOWN_CONTEXT": ("WARNING", "Console context is unknown; verify line before trusting it."),
+}
+RISKY_MAPPING = {
+    "MISMATCH": ("HIGH", "Detected alias does not match expected inventory."),
+    "NOT DETECTED": ("HIGH", "Expected inventory line/device was not detected."),
+    "UNMANAGED": ("WARNING", "Detected console line has no managed inventory mapping."),
+    "NO LINE": ("WARNING", "Inventory device has no expected console line."),
+}
+EVENT_RISK_ALIAS = {
+    "DEVICE_CONSOLE_LINE_CHANGED": "LINE_CHANGED",
+    "EXPECTED_DEVICE_NOT_DETECTED": "NOT_DETECTED",
+}
+
+
+def _safe_int(value: object) -> int | None:
+    if not has_value(value):
+        return None
+    try:
+        return int(float(str(value).strip()))
+    except ValueError:
+        return None
+
+
+def _event_sort_key(event: dict[str, object]) -> tuple[int, str]:
+    severity = str(event.get("severity") or "").upper()
+    return (SEVERITY_ORDER.get(severity, 9), str(event.get("last_seen") or ""))
+
+
+def build_event_indexes(events: list[dict[str, object]]):
+    by_line: dict[tuple[int, int], list[dict[str, object]]] = {}
+    by_device: dict[int, list[dict[str, object]]] = {}
+    for event in events:
+        if str(event.get("status") or "").upper() == "RESOLVED":
+            continue
+        oob_id = _safe_int(event.get("oob_id"))
+        line_no = _safe_int(event.get("line_no"))
+        device_id = _safe_int(event.get("device_id"))
+        if oob_id is not None and line_no is not None:
+            by_line.setdefault((oob_id, line_no), []).append(event)
+        if device_id is not None:
+            by_device.setdefault(device_id, []).append(event)
+    return by_line, by_device
+
+
+def row_risk(
+    row: dict[str, object] | pd.Series,
+    events_by_line: dict[tuple[int, int], list[dict[str, object]]],
+    events_by_device: dict[int, list[dict[str, object]]],
+) -> tuple[str, str, str]:
+    oob_id = _safe_int(row.get("OOBID"))
+    line_no = _safe_int(row.get("Line"))
+    device_id = _safe_int(row.get("DeviceID"))
+
+    events: list[dict[str, object]] = []
+    if oob_id is not None and line_no is not None:
+        events.extend(events_by_line.get((oob_id, line_no), []))
+    if device_id is not None:
+        events.extend(events_by_device.get(device_id, []))
+    if events:
+        event = sorted(events, key=_event_sort_key)[0]
+        event_type = str(event.get("event_type") or "").upper()
+        risk = EVENT_RISK_ALIAS.get(event_type, event_type)
+        severity = str(event.get("severity") or "").upper()
+        issue = str(event.get("message") or "").strip()
+        return risk or "ALERT", severity, issue
+
+    health = str(row.get("Health") or "").upper()
+    if health in RISKY_HEALTH:
+        severity, issue = RISKY_HEALTH[health]
+        return health, severity, str(row.get("Health Reason") or issue)
+
+    mapping = str(row.get("Mapping") or "").upper()
+    if mapping in RISKY_MAPPING:
+        severity, issue = RISKY_MAPPING[mapping]
+        return mapping.replace(" ", "_"), severity, issue
+
+    verification = str(row.get("Verification") or "").upper()
+    if device_id is not None and verification != "VERIFIED":
+        return (
+            "UNVERIFIED_LINE",
+            "WARNING",
+            "Line/device identity has not been verified with operator evidence.",
+        )
+
+    return "OK", "", "No active troubleshooting risk detected."
+
+
 DEVICE_COLUMN_CONFIG = {
     "OOB": st.column_config.TextColumn("OOB", width="medium"),
     "Line": st.column_config.NumberColumn("Line", width="small"),
     "Device": st.column_config.TextColumn("Device", width="medium"),
     "Type": st.column_config.TextColumn("Type", width="small"),
-    "Mgmt IP": st.column_config.TextColumn("Mgmt IP", width="medium"),
+    "IP": st.column_config.TextColumn("IP", width="medium"),
     "Alias": st.column_config.TextColumn("Alias", width="medium"),
+    "TCP Port": st.column_config.NumberColumn("TCP Port", width="small"),
     "Status": st.column_config.TextColumn("Status", width="small"),
     "Session": st.column_config.TextColumn("Session", width="small"),
     "Health": st.column_config.TextColumn("Health", width="medium"),
     "Mapping": st.column_config.TextColumn("Mapping", width="medium"),
+    "Risk": st.column_config.TextColumn("Risk", width="medium"),
+    "Severity": st.column_config.TextColumn("Severity", width="small"),
     "Verification": st.column_config.TextColumn("Verification", width="medium"),
     "Last Seen": st.column_config.TextColumn("Last Seen", width="medium"),
 }
@@ -1112,6 +1263,16 @@ render_status_strip(
 if active_page == "Devices":
     rows = build_rows()
     df = pd.DataFrame(rows)
+    if not df.empty:
+        df["IP"] = df.apply(display_ip, axis=1)
+        events_by_line, events_by_device = build_event_indexes(list_change_events(limit=1000))
+        risk_values = df.apply(
+            lambda item: row_risk(item, events_by_line, events_by_device),
+            axis=1,
+        )
+        df["Risk"] = [item[0] for item in risk_values]
+        df["Severity"] = [item[1] for item in risk_values]
+        df["Issue"] = [item[2] for item in risk_values]
     alert_counts = count_open_events()
 
     total = len(df) if not df.empty else 0
@@ -1119,6 +1280,7 @@ if active_page == "Devices":
     busy = int((df["Status"] == "BUSY").sum()) if not df.empty else 0
     mismatch = int((df["Mapping"] == "MISMATCH").sum()) if not df.empty else 0
     health_attention = int(df["Health"].isin(["STALE_SESSION", "BUSY_NO_USER", "INCONSISTENT", "NO_OUTPUT", "BOOTLOADER_OR_ROMMON", "UNKNOWN_CONTEXT"]).sum()) if not df.empty else 0
+    risk_attention = int((df["Risk"] != "OK").sum()) if not df.empty else 0
     open_alerts = sum(alert_counts.values())
 
     m1,m2,m3,m4,m5,m6 = st.columns(6)
@@ -1126,18 +1288,18 @@ if active_page == "Devices":
     render_kpi(m2, "Available", available, "green", "ready console")
     render_kpi(m3, "Busy", busy, "amber", "active sessions")
     render_kpi(m4, "Mismatch", mismatch, "red" if mismatch else "green", "mapping drift")
-    render_kpi(m5, "Health Review", health_attention, "amber" if health_attention else "green", "session context")
+    render_kpi(m5, "Risk Review", risk_attention, "amber" if risk_attention else "green", "troubleshooting")
     render_kpi(m6, "Open Alerts", open_alerts, "red" if open_alerts else "green", "needs attention")
 
     if not df.empty:
         chart1, chart2 = st.columns(2)
         render_bar_chart(chart1, "Console Status", count_rows(df, "Status"))
-        render_bar_chart(chart2, "Session Health", count_rows(df, "Health"))
+        render_bar_chart(chart2, "Troubleshooting Risk", count_rows(df, "Risk"))
 
     st.write("**Quick Hostname Lookup**")
     hostname_lookup = st.text_input(
         "Hostname lookup",
-        placeholder="Type hostname to find OOB, line, alias, status, and management IP...",
+        placeholder="Type hostname to find OOB, line, alias, status, and IP...",
         label_visibility="collapsed",
         key="hostname_lookup",
     )
@@ -1147,7 +1309,7 @@ if active_page == "Devices":
         else:
             lookup_needle = hostname_lookup.strip().lower()
             lookup_mask = pd.Series(False, index=df.index)
-            for col in ["Device", "Verified Hostname", "Alias", "Mgmt IP", "Serial"]:
+            for col in ["Device", "Verified Hostname", "Alias", "IP", "Mgmt IP", "Serial"]:
                 lookup_mask |= (
                     df[col]
                     .fillna("")
@@ -1174,8 +1336,8 @@ if active_page == "Devices":
                     ascending=[False, True, True],
                 )
                 lookup_cols = [
-                    "OOB", "OOB Host", "Line", "Device", "Alias", "TCP Port",
-                    "Status", "Session", "Health", "Mgmt IP", "Mapping",
+                    "OOB", "Line", "Device", "IP", "Alias", "TCP Port",
+                    "Status", "Health", "Risk", "Mapping",
                     "Verification", "Last Seen",
                 ]
                 st.dataframe(
@@ -1199,7 +1361,7 @@ if active_page == "Devices":
             [
                 "All","AVAILABLE","BUSY","UNKNOWN","MISMATCH","UNMANAGED","NOT DETECTED","NO LINE",
                 "ACTIVE_OPERATOR","STALE_SESSION","BUSY_NO_USER","INCONSISTENT","NO_OUTPUT",
-                "BOOTLOADER_OR_ROMMON","UNKNOWN_CONTEXT",
+                "BOOTLOADER_OR_ROMMON","UNKNOWN_CONTEXT","RISK",
             ],
             label_visibility="collapsed",
         )
@@ -1218,7 +1380,7 @@ if active_page == "Devices":
     if not shown.empty:
         if q.strip():
             needle = q.strip().lower()
-            cols = ["Device","Alias","Line","Mgmt IP","Serial","Rack","Site","Type","OOB"]
+            cols = ["Device","Alias","Line","IP","Mgmt IP","Serial","Rack","Site","Type","OOB"]
             mask = pd.Series(False, index=shown.index)
             for col in cols:
                 mask |= (
@@ -1235,6 +1397,8 @@ if active_page == "Devices":
                 shown = shown[shown["Mapping"] == filt]
             elif filt in {"ACTIVE_OPERATOR","STALE_SESSION","BUSY_NO_USER","INCONSISTENT","NO_OUTPUT","BOOTLOADER_OR_ROMMON","UNKNOWN_CONTEXT"}:
                 shown = shown[shown["Health"] == filt]
+            elif filt == "RISK":
+                shown = shown[shown["Risk"] != "OK"]
             else:
                 shown = shown[shown["Status"] == filt]
 
@@ -1242,28 +1406,53 @@ if active_page == "Devices":
             shown = shown[shown["OOB"] == oob_filter]
 
     table_cols = [
-        "OOB","Line","Device","Type","Mgmt IP",
-        "Alias","Status","Session","Health","Mapping","Verification","Last Seen"
+        "OOB","Line","Device","IP","TCP Port","Status","Risk"
     ]
 
     if shown.empty:
         render_empty_state("No data. Add OOB, then Connect & Scan.")
     else:
-        st.dataframe(
+        st.caption("Click một dòng để xem chi tiết; thao tác kết nối nằm ở panel bên phải hoặc ngay bên dưới trên màn hẹp.")
+        table_event = st.dataframe(
             styled_table(shown[table_cols]),
             width="stretch",
             hide_index=True,
             column_config=DEVICE_COLUMN_CONFIG,
-            height=min(560, 72 + len(shown) * 35),
+            height=min(460, 72 + len(shown) * 35),
+            on_select="rerun",
+            selection_mode="single-row",
+            key="devices_console_table",
         )
+        selected_table_row = None
+        table_selection = getattr(table_event, "selection", {})
+        if isinstance(table_selection, dict):
+            selected_positions = table_selection.get("rows", [])
+        else:
+            selected_positions = getattr(table_selection, "rows", [])
+        if selected_positions:
+            selected_pos = int(selected_positions[0])
+            if 0 <= selected_pos < len(shown):
+                selected_table_row = shown.iloc[selected_pos].to_dict()
 
         labels = {
             f"{r['Device']} · {r['OOB']} · Line {r['Line'] if pd.notna(r['Line']) else '-'}": r
             for r in shown.to_dict("records")
         }
+        selected_detail_label = None
+        if selected_table_row:
+            selected_detail_label = (
+                f"{selected_table_row['Device']} · {selected_table_row['OOB']} · "
+                f"Line {selected_table_row['Line'] if pd.notna(selected_table_row['Line']) else '-'}"
+            )
+        label_list = list(labels.keys())
+        default_detail_index = (
+            label_list.index(selected_detail_label)
+            if selected_detail_label in labels else 0
+        )
         selected_label = st.selectbox(
             "Device detail",
-            list(labels.keys()),
+            label_list,
+            index=default_detail_index,
             label_visibility="collapsed",
         )
         row = labels[selected_label]
@@ -1291,7 +1480,11 @@ if active_page == "Devices":
                 ["Health Reason", row.get("Health Reason", "-") or "-"],
                 ["Prompt Context", row.get("Prompt Context", "-") or "-"],
                 ["Mapping", row["Mapping"]],
-                ["Mgmt IP", row["Mgmt IP"] or "-"],
+                ["Risk", row.get("Risk", "OK") or "OK"],
+                ["Severity", row.get("Severity", "-") or "-"],
+                ["Issue", row.get("Issue", "-") or "-"],
+                ["IP", row["IP"] or "-"],
+                ["Inventory Mgmt IP", row["Mgmt IP"] or "-"],
                 ["Vendor/Model", f"{row['Vendor']} {row['Model']}".strip() or "-"],
                 ["Serial", row["Serial"] or "-"],
                 ["Verification", row.get("Verification", "-") or "-"],
@@ -1308,9 +1501,56 @@ if active_page == "Devices":
                 hide_index=True,
                 height=460,
             )
+            with st.expander("Troubleshooting runbook"):
+                selected_line = (
+                    int(float(str(row["Line"]).strip()))
+                    if has_value(row.get("Line")) else None
+                )
+                st.write("OOB checks")
+                oob_cmds = []
+                if selected_line is not None:
+                    oob_cmds.extend([
+                        f"show line {selected_line}",
+                        f"show users | include {selected_line}",
+                    ])
+                oob_cmds.extend([
+                    "show running-config | include ^menu",
+                    "show running-config | include ^ip host",
+                ])
+                st.code("\n".join(oob_cmds), language="text")
+                if console_telnet_command(row):
+                    st.write("Console connect")
+                    st.code(console_telnet_command(row), language="powershell")
+                st.write("Read-only commands after console login")
+                st.code(
+                    "\n".join([
+                        "terminal length 0",
+                        "show version",
+                        "show inventory",
+                        "show logging | last 50",
+                    ]),
+                    language="text",
+                )
+                if selected_line is not None:
+                    st.write("Impact command, use only with confirmation")
+                    st.code(clear_line_command(row), language="text")
 
         with c2:
             st.write("**Actions**")
+
+            risk = str(row.get("Risk") or "OK").upper()
+            severity = str(row.get("Severity") or "").upper()
+            issue = str(row.get("Issue") or "").strip()
+            if risk != "OK":
+                risk_text = f"{risk}" + (f" · {severity}" if severity else "")
+                if severity in {"CRITICAL", "HIGH"}:
+                    st.error(risk_text)
+                else:
+                    st.warning(risk_text)
+                if issue:
+                    st.caption(issue)
+            else:
+                st.success("Risk OK")
 
             if row["Status"] == "BUSY":
                 st.warning(f"Console line đang BUSY · {row['Session'] or 'unknown user'}")
@@ -1348,10 +1588,13 @@ if active_page == "Devices":
                     except Exception as exc:
                         st.error(str(exc))
 
-            if has_value(row["TCP Port"]) and has_value(row["OOB Host"]):
+            console_ip = row.get("IP") or row.get("OOB Host")
+            if has_value(row["TCP Port"]) and has_value(console_ip):
                 tcp_port = as_port(row["TCP Port"])
+                row_line_no = int(float(str(row["Line"]).strip())) if has_value(row["Line"]) else None
+                console_error_key = f"{row['OOBID']}|{row_line_no}|{tcp_port}"
                 st.code(
-                    f"telnet {row['OOB Host']} {tcp_port}",
+                    console_telnet_command(row),
                     language="powershell",
                 )
                 console_uses_securecrt = console_launcher == "SecureCRT Telnet"
@@ -1362,8 +1605,9 @@ if active_page == "Devices":
                 )
                 if st.button(console_label, width="stretch", type="primary"):
                     try:
+                        check_tcp_reachable(console_ip, tcp_port)
                         if console_uses_securecrt:
-                            launch_securecrt_telnet(row["OOB Host"], tcp_port, securecrt_path)
+                            launch_securecrt_telnet(console_ip, tcp_port, securecrt_path)
                             audit(
                                 "launch_securecrt_console",
                                 oob_id=row["OOBID"],
@@ -1372,7 +1616,7 @@ if active_page == "Devices":
                             )
                             st.toast("SecureCRT console opened.")
                         else:
-                            launch_windows_telnet(row["OOB Host"], tcp_port)
+                            launch_windows_telnet(console_ip, tcp_port)
                             audit(
                                 "launch_telnet_console",
                                 oob_id=row["OOBID"],
@@ -1381,12 +1625,14 @@ if active_page == "Devices":
                             )
                             st.toast("Console telnet opened.")
                     except Exception as exc:
+                        st.session_state["_console_last_error_key"] = console_error_key
                         st.error(str(exc))
                 with st.expander("Other console launcher"):
                     if console_uses_securecrt:
                         if st.button("Open with Windows Telnet", width="stretch"):
                             try:
-                                launch_windows_telnet(row["OOB Host"], tcp_port)
+                                check_tcp_reachable(console_ip, tcp_port)
+                                launch_windows_telnet(console_ip, tcp_port)
                                 audit(
                                     "launch_telnet_console",
                                     oob_id=row["OOBID"],
@@ -1395,11 +1641,13 @@ if active_page == "Devices":
                                 )
                                 st.toast("Console telnet opened.")
                             except Exception as exc:
+                                st.session_state["_console_last_error_key"] = console_error_key
                                 st.error(str(exc))
                     else:
                         if st.button("Open with SecureCRT", width="stretch"):
                             try:
-                                launch_securecrt_telnet(row["OOB Host"], tcp_port, securecrt_path)
+                                check_tcp_reachable(console_ip, tcp_port)
+                                launch_securecrt_telnet(console_ip, tcp_port, securecrt_path)
                                 audit(
                                     "launch_securecrt_console",
                                     oob_id=row["OOBID"],
@@ -1408,7 +1656,141 @@ if active_page == "Devices":
                                 )
                                 st.toast("SecureCRT console opened.")
                             except Exception as exc:
+                                st.session_state["_console_last_error_key"] = console_error_key
                                 st.error(str(exc))
+
+                if target_oob and row_line_no is not None:
+                    with st.expander(
+                        "Clear line rồi connect lại",
+                        expanded=st.session_state.get("_console_last_error_key") == console_error_key,
+                    ):
+                        st.code(clear_line_command(row), language="text")
+                        active_clear_session = (
+                            live.connected
+                            and live.oob_id is not None
+                            and int(live.oob_id) == int(row["OOBID"])
+                        )
+                        if active_clear_session:
+                            if st.button(
+                                f"Clear line {row_line_no} bằng session đang kết nối",
+                                width="stretch",
+                                type="primary",
+                                key=f"clear_connected_{row['OOBID']}_{row_line_no}",
+                            ):
+                                try:
+                                    target_profile = load_profile(str(target_oob.get("profile_key") or "cisco"))
+                                    with st.spinner(f"Đang clear line {row_line_no} trên session active..."):
+                                        clear_output = live.clear_line(
+                                            row_line_no,
+                                            timeout=int(target_profile.get("command_timeout", 15)),
+                                        )
+                                    check_tcp_reachable(console_ip, tcp_port, attempts=4, delay=1.0)
+                                    if console_uses_securecrt:
+                                        launch_securecrt_telnet(console_ip, tcp_port, securecrt_path)
+                                    else:
+                                        launch_windows_telnet(console_ip, tcp_port)
+                                    audit(
+                                        "clear_line_connected_then_console",
+                                        oob_id=row["OOBID"],
+                                        device_id=row["DeviceID"],
+                                        detail=(
+                                            f"line={row_line_no};device={row['Device']};"
+                                            f"tcp={tcp_port};output={str(clear_output)[:200]}"
+                                        ),
+                                    )
+                                    st.session_state.pop("_console_last_error_key", None)
+                                    st.session_state["_flash_success"] = (
+                                        f"Đã clear line {row_line_no} bằng session active và mở console."
+                                    )
+                                    st.rerun()
+                                except Exception as exc:
+                                    st.session_state["_console_last_error_key"] = console_error_key
+                                    st.session_state["_flash_error"] = (
+                                        f"Clear line failed: {type(exc).__name__}: {exc}"
+                                    )
+                                    st.rerun()
+                            st.caption("Đang dùng session OOB active trong app; không cần nhập lại password.")
+                        else:
+                            st.info(
+                                "Muốn clear line một phát thì vào Discovery, tick "
+                                "'Keep OOB session active for clear-line actions' rồi scan OOB CLI."
+                            )
+                        clear_user_key = f"clear_line_user_{row['OOBID']}_{row_line_no}"
+                        clear_pass_key = f"clear_line_pass_{row['OOBID']}_{row_line_no}"
+                        clear_confirm_key = f"clear_line_confirm_{row['OOBID']}_{row_line_no}"
+                        clear_user = st.text_input(
+                            "OOB Username",
+                            value=target_oob["username"],
+                            key=clear_user_key,
+                        )
+                        clear_pass = st.text_input(
+                            "OOB Password",
+                            type="password",
+                            key=clear_pass_key,
+                            help="Dùng một lần để SSH vào OOB chạy clear line; không lưu database.",
+                        )
+                        clear_confirm = st.checkbox(
+                            f"Confirm clear line {row_line_no}",
+                            key=clear_confirm_key,
+                        )
+                        if st.button(
+                            "Clear line rồi mở console",
+                            width="stretch",
+                            disabled=not clear_confirm,
+                            key=f"clear_then_connect_{row['OOBID']}_{row_line_no}",
+                        ):
+                            try:
+                                target_profile = load_profile(str(target_oob.get("profile_key") or "cisco"))
+                                with st.spinner(f"Đang clear line {row_line_no} trên {target_oob['name']}..."):
+                                    clear_output = clear_console_line(
+                                        host=target_oob["host"],
+                                        port=int(target_oob["port"]),
+                                        username=clear_user,
+                                        password=clear_pass,
+                                        device_type=target_profile.get("netmiko_device_type", "cisco_ios"),
+                                        line_no=row_line_no,
+                                        connect_timeout=int(target_profile.get("connect_timeout", 8)),
+                                        command_timeout=int(target_profile.get("command_timeout", 15)),
+                                    )
+                                check_tcp_reachable(console_ip, tcp_port, attempts=4, delay=1.0)
+                                if console_uses_securecrt:
+                                    launch_securecrt_telnet(console_ip, tcp_port, securecrt_path)
+                                else:
+                                    launch_windows_telnet(console_ip, tcp_port)
+                                audit(
+                                    "clear_line_then_console",
+                                    oob_id=row["OOBID"],
+                                    device_id=row["DeviceID"],
+                                    detail=(
+                                        f"line={row_line_no};device={row['Device']};"
+                                        f"tcp={tcp_port};output={str(clear_output)[:200]}"
+                                    ),
+                                )
+                                st.session_state.pop("_console_last_error_key", None)
+                                st.session_state["_clear_secret_keys"] = [clear_pass_key]
+                                st.session_state["_flash_success"] = (
+                                    f"Đã clear line {row_line_no} và mở console telnet {console_ip}:{tcp_port}."
+                                )
+                                st.rerun()
+                            except NetmikoAuthenticationException:
+                                st.session_state["_clear_secret_keys"] = [clear_pass_key]
+                                st.session_state["_flash_error"] = (
+                                    "Clear line failed: sai username/password hoặc user không đủ quyền."
+                                )
+                                st.rerun()
+                            except NetmikoTimeoutException:
+                                st.session_state["_clear_secret_keys"] = [clear_pass_key]
+                                st.session_state["_flash_error"] = (
+                                    "Clear line failed: SSH timeout tới OOB. Kiểm tra IP/port/routing/ACL."
+                                )
+                                st.rerun()
+                            except Exception as exc:
+                                st.session_state["_console_last_error_key"] = console_error_key
+                                st.session_state["_clear_secret_keys"] = [clear_pass_key]
+                                st.session_state["_flash_error"] = (
+                                    f"Clear line failed: {type(exc).__name__}: {exc}"
+                                )
+                                st.rerun()
 
             if has_value(row["Mgmt IP"]):
                 ssh_user = target_oob["username"] if target_oob else ""
@@ -1887,7 +2269,7 @@ if active_page == "Devices":
 # ==============================================================
 if active_page == "OOB Nodes":
     st.subheader("OOB Nodes")
-    st.caption("IP · SSH · profile · site")
+    st.caption("IP · SSH/API · profile · site")
 
     oob_df = pd.DataFrame(oobs)
 
@@ -1948,10 +2330,11 @@ if active_page == "OOB Nodes":
                 host = st.text_input("IP / Hostname", value="" if oe == -1 else existing["host"])
             with b:
                 port = st.number_input(
-                    "SSH Port",
+                    "SSH Port (CLI scan)",
                     1,
                     65535,
                     value=22 if oe == -1 else int(existing["port"]),
+                    help="Vertiv API scan dùng API HTTPS Port ở màn Discovery, không dùng port SSH này.",
                 )
             with c:
                 username = st.text_input(
@@ -2228,15 +2611,18 @@ if active_page == "Discovery":
         use_vertiv_api = selected_scan_source == "Vertiv ACS API (read-only)"
         use_cli_scan = selected_scan_source == "OOB CLI qua Netmiko (read-only)"
         profile_ready = use_vertiv_api or use_cli_scan
+        keep_cli_session = False
 
         api_port = int(profile.get("api_default_port", 48048))
+        api_timeout = int(profile.get("api_timeout", 20))
         verify_tls = bool(profile.get("api_verify_tls_default", False))
+        api_target_url = f"https://{target['host']}:{api_port}/api/v1/"
         if use_vertiv_api:
             st.info(
                 "Vertiv ACS sẽ scan bằng REST API read-only: serial ports, active sessions, system info. "
                 "Không gọi power on/off/cycle và không kill session."
             )
-            api_a, api_b = st.columns([1, 1])
+            api_a, api_b, api_c = st.columns([1, 1, 1])
             with api_a:
                 api_port = int(
                     st.number_input(
@@ -2248,11 +2634,37 @@ if active_page == "Discovery":
                     )
                 )
             with api_b:
+                api_timeout = int(
+                    st.number_input(
+                        "API Timeout (seconds)",
+                        min_value=3,
+                        max_value=45,
+                        value=int(profile.get("api_timeout", 20)),
+                        step=1,
+                        help="Tăng giá trị này nếu ACS phản hồi chậm nhưng route/port chắc chắn đúng.",
+                    )
+                )
+            with api_c:
                 verify_tls = st.checkbox(
                     "Verify TLS certificate",
                     value=bool(profile.get("api_verify_tls_default", False)),
                     help="Bật nếu ACS dùng certificate hợp lệ. Tắt khi lab/OOB dùng self-signed certificate.",
                 )
+            api_target_url = f"https://{target['host']}:{api_port}/api/v1/"
+            st.caption(
+                f"Vertiv API target: {api_target_url} · "
+                f"OOB SSH port {target['port']} không dùng cho scan API."
+            )
+
+        if use_cli_scan:
+            keep_cli_session = st.checkbox(
+                "Keep OOB session active for clear-line actions",
+                value=False,
+                help=(
+                    "Bật nếu muốn sau scan vẫn giữ phiên SSH tới OOB để bấm clear line "
+                    "không cần nhập lại password. Password vẫn không lưu database."
+                ),
+            )
 
         if not profile_ready:
             st.warning(
@@ -2300,7 +2712,7 @@ if active_page == "Discovery":
                         username=username,
                         password=password,
                         verify_tls=verify_tls,
-                        timeout=int(profile.get("api_timeout", 10)),
+                        timeout=api_timeout,
                     )
                     password = ""
                     check = preflight_vertiv_api(client)
@@ -2328,7 +2740,7 @@ if active_page == "Discovery":
             except VertivAPIError as exc:
                 st.session_state["_clear_disc_pass"] = True
                 st.session_state["_flash_error"] = (
-                    f"Vertiv API chưa sẵn sàng: {exc}. "
+                    f"Vertiv API chưa sẵn sàng tại {api_target_url}: {exc}. "
                     "Kiểm tra API port, security profile/access rights, route/ACL hoặc TLS setting."
                 )
                 st.rerun()
@@ -2355,7 +2767,7 @@ if active_page == "Discovery":
                                 username=username,
                                 password=password,
                                 verify_tls=verify_tls,
-                                timeout=int(profile.get("api_timeout", 10)),
+                                timeout=api_timeout,
                             )
                             password = ""
                         else:
@@ -2378,8 +2790,9 @@ if active_page == "Discovery":
                                     live, target["id"], target["profile_key"], acquire_lock=False
                                 )
                             finally:
-                                # Short-lived scan session: never keep management SSH open in background.
-                                live.disconnect()
+                                # Default is short-lived. Operator may keep it active for clear-line actions.
+                                if not keep_cli_session:
+                                    live.disconnect()
 
                         if use_vertiv_api:
                             result = scan_vertiv_api(
@@ -2444,7 +2857,7 @@ if active_page == "Discovery":
                 st.rerun()
             except VertivAPIError as exc:
                 st.session_state["_clear_disc_pass"] = True
-                st.session_state["_flash_error"] = f"Vertiv API error: {exc}"
+                st.session_state["_flash_error"] = f"Vertiv API error tại {api_target_url}: {exc}"
                 st.rerun()
             except ScanBusyError as exc:
                 st.session_state["_clear_disc_pass"] = True

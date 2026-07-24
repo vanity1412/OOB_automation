@@ -126,6 +126,25 @@ class LiveOOB:
             strip_command=True,
         )
 
+    def clear_line(self, line_no: int, timeout: int = 15) -> str:
+        if not self.connected:
+            raise RuntimeError("No active OOB session for clear line.")
+        command = _clear_line_command(line_no)
+        output = self.conn.send_command_timing(
+            command,
+            strip_prompt=False,
+            strip_command=False,
+            read_timeout=max(5, min(int(timeout), 45)),
+        )
+        if "confirm" in output.lower() or "[y/n]" in output.lower():
+            output += self.conn.send_command_timing(
+                "\n",
+                strip_prompt=False,
+                strip_command=False,
+                read_timeout=max(5, min(int(timeout), 45)),
+            )
+        return output
+
     def disconnect(self) -> None:
         if self.conn is not None:
             try:
@@ -141,3 +160,64 @@ class LiveOOB:
         self.username = ""
         self.profile_key = ""
         self.prompt = ""
+
+
+def _clear_line_command(line_no: int) -> str:
+    safe_line = int(line_no)
+    if not (0 <= safe_line <= 9999):
+        raise ValueError("Console line must be between 0 and 9999.")
+    return f"clear line {safe_line}"
+
+
+def clear_console_line(
+    *,
+    host: str,
+    port: int,
+    username: str,
+    password: str,
+    device_type: str,
+    line_no: int,
+    connect_timeout: int = 8,
+    auth_timeout: int = 10,
+    banner_timeout: int = 10,
+    command_timeout: int = 15,
+) -> str:
+    """Run one guarded Cisco-style clear-line command using a short-lived SSH session."""
+    if not password:
+        raise ValueError("Password is required to clear a console line.")
+    command = _clear_line_command(line_no)
+    conn: Any | None = None
+    try:
+        conn = ConnectHandler(
+            device_type=device_type,
+            host=host.strip(),
+            port=int(port),
+            username=username.strip(),
+            password=password,
+            conn_timeout=max(3, int(connect_timeout)),
+            auth_timeout=max(3, int(auth_timeout)),
+            banner_timeout=max(3, int(banner_timeout)),
+            fast_cli=False,
+        )
+        output = conn.send_command_timing(
+            command,
+            strip_prompt=False,
+            strip_command=False,
+            read_timeout=max(5, min(int(command_timeout), 45)),
+        )
+        if "confirm" in output.lower() or "[y/n]" in output.lower():
+            output += conn.send_command_timing(
+                "\n",
+                strip_prompt=False,
+                strip_command=False,
+                read_timeout=max(5, min(int(command_timeout), 45)),
+            )
+        LiveOOB._scrub_netmiko_credentials(conn)
+        return output
+    finally:
+        if conn is not None:
+            try:
+                LiveOOB._scrub_netmiko_credentials(conn)
+                conn.disconnect()
+            except Exception:
+                pass

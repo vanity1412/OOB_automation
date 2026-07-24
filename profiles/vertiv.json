@@ -16,7 +16,7 @@
   "api_supported": true,
   "api_default_port": 48048,
   "api_verify_tls_default": false,
-  "api_timeout": 10,
+  "api_timeout": 20,
   "min_line_retention_ratio": 0.6,
   "command_timeout": 15,
   "connect_timeout": 8,

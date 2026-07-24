@@ -10,6 +10,7 @@ from .discovery import (
     has_cli_error,
     merge,
     parse_cisco_hosts,
+    parse_cisco_menu,
     parse_generic_host_mappings,
     parse_lines,
     parse_users,
@@ -78,28 +79,62 @@ def scan(session, oob_id: int, profile_key: str, *, acquire_lock: bool = True) -
 
             base = int(profile.get("reverse_tcp_base", 2000))
             host_text = raw.get("hosts", {}).get("output", "")
+            menu_text = raw.get("menu", {}).get("output", "")
             line_text = raw.get("lines", {}).get("output", "")
             user_text = raw.get("users", {}).get("output", "")
 
             previous = latest_snapshot_map(oob_id)
             line_map = parse_lines(line_text)
             users = parse_users(user_text)
+            mapping_text = host_text
+            mapping_warnings: list[str] = []
+            include_unmapped_lines = True
+            apply_line_state = True
             if profile.get("vendor") == "cisco":
                 host_records = parse_cisco_hosts(host_text, base)
+                if not host_records:
+                    menu_records = parse_cisco_menu(menu_text)
+                    if menu_records:
+                        host_records = menu_records
+                        mapping_text = menu_text
+                        include_unmapped_lines = False
+                        menu_lines = {int(row.line_no) for row in menu_records}
+                        line_overlap = (
+                            len(menu_lines & set(line_map)) / len(menu_lines)
+                            if menu_lines else 0.0
+                        )
+                        min_overlap = float(profile.get("menu_line_state_min_overlap", 0.50))
+                        mapping_warnings.append(
+                            "Cisco menu mapping được dùng thay cho ip host mapping."
+                        )
+                        if line_overlap < min_overlap:
+                            apply_line_state = False
+                            users = {}
+                            mapping_warnings.append(
+                                "Menu item number không khớp đủ với show line; "
+                                "bỏ status/session raw để tránh gán sai line."
+                            )
             else:
                 host_records = parse_generic_host_mappings(host_text, base)
 
-            parsed_records = merge(host_records, line_map, users)
+            parsed_records = merge(
+                host_records,
+                line_map,
+                users,
+                include_unmapped_lines=include_unmapped_lines,
+                apply_line_state=apply_line_state,
+            )
             quality = evaluate_parse_quality(
                 profile=profile,
                 line_output=line_text,
                 user_output=user_text,
-                host_output=host_text,
+                host_output=mapping_text,
                 line_map=line_map,
                 host_records=host_records,
                 users=users,
                 merged_rows=parsed_records,
                 previous=previous,
+                extra_warnings=mapping_warnings,
             )
 
             # Hard quality gate: rejected parse never overwrites current state,

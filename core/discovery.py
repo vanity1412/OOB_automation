@@ -72,6 +72,76 @@ def parse_cisco_hosts(text: str, base: int) -> list[PortRecord]:
     return out
 
 
+def parse_cisco_menu(text: str) -> list[PortRecord]:
+    out: list[PortRecord] = []
+    if not (text or "").strip():
+        return out
+
+    next_menu = (
+        r"(?=\s+\bmenu\s+\S+\s+"
+        r"(?:text|command|title|prompt|clear-screen|line-mode|status-line|single-space)"
+        r"\b|$)"
+    )
+    text_pat = re.compile(
+        r"\bmenu\s+(\S+)\s+text\s+(?:\[(\d+)\]|(\d+))\s*"
+        r"(?:[-=]+>\s*)?(.+?)" + next_menu,
+        re.I | re.S,
+    )
+    command_pat = re.compile(
+        r"\bmenu\s+(\S+)\s+command\s+(\d+)\s+telnet\s+(\S+)\s+(\d+)",
+        re.I,
+    )
+
+    entries: dict[str, dict[int, dict[str, Any]]] = {}
+    for menu_name, bracket_item, plain_item, alias in text_pat.findall(text or ""):
+        item = int(bracket_item or plain_item)
+        clean_alias = re.sub(r"\s+", " ", alias).strip()
+        entries.setdefault(menu_name, {}).setdefault(item, {})["alias"] = clean_alias
+
+    for menu_name, item_text, host, port_text in command_pat.findall(text or ""):
+        item = int(item_text)
+        entry = entries.setdefault(menu_name, {}).setdefault(item, {})
+        entry["target_host"] = host.strip("[](),")
+        entry["tcp_port"] = int(port_text)
+
+    command_groups: dict[str, list[tuple[int, dict[str, Any]]]] = {}
+    for menu_name, items in entries.items():
+        rows = [
+            (item, entry)
+            for item, entry in items.items()
+            if entry.get("tcp_port") is not None
+        ]
+        if rows:
+            command_groups[menu_name] = rows
+
+    if not command_groups:
+        return out
+
+    # Prefer the menu with the most telnet commands. This avoids mixing helper
+    # menus like "cisco" with the actual OOB menu when a broad include is used.
+    best_menu = max(
+        sorted(command_groups),
+        key=lambda name: (len(command_groups[name]), name.lower()),
+    )
+    for item, entry in sorted(command_groups[best_menu], key=lambda row: row[0]):
+        alias = str(entry.get("alias") or f"{best_menu}-{item}").strip()
+        target_host = str(entry.get("target_host") or "").strip()
+        tcp_port = int(entry["tcp_port"])
+        out.append(
+            PortRecord(
+                line_no=item,
+                alias=alias,
+                tcp_port=tcp_port,
+                target_host=target_host,
+                raw_line=(
+                    f"menu {best_menu} item {item}: {alias} -> "
+                    f"telnet {target_host} {tcp_port}"
+                ),
+            )
+        )
+    return out
+
+
 def parse_generic_host_mappings(text: str, base: int) -> list[PortRecord]:
     out: list[PortRecord] = []
     seen: set[tuple[int, str]] = set()
@@ -148,14 +218,28 @@ def parse_users(text: str) -> dict[int, str]:
 
 
 def merge(
-    hosts: list[PortRecord], lines: dict[int, dict[str, str]], users: dict[int, str]
+    hosts: list[PortRecord],
+    lines: dict[int, dict[str, str]],
+    users: dict[int, str],
+    *,
+    include_unmapped_lines: bool = True,
+    apply_line_state: bool = True,
 ) -> list[dict[str, Any]]:
     data: dict[int, PortRecord] = {x.line_no: x for x in hosts}
+    host_lines = set(data)
     for line_no, info in lines.items():
+        if not include_unmapped_lines and line_no not in host_lines:
+            continue
+        if not apply_line_state and line_no in host_lines:
+            continue
         data.setdefault(line_no, PortRecord(line_no=line_no))
         data[line_no].state = info.get("state", "UNKNOWN")
         data[line_no].raw_line = info.get("raw_line", "")
     for line_no, user in users.items():
+        if not include_unmapped_lines and line_no not in host_lines:
+            continue
+        if not apply_line_state and line_no in host_lines:
+            continue
         data.setdefault(line_no, PortRecord(line_no=line_no))
         data[line_no].session_user = user
         data[line_no].state = "BUSY"
@@ -198,9 +282,10 @@ def evaluate_parse_quality(
     users: dict[int, str],
     merged_rows: list[dict[str, Any]],
     previous: dict[int, dict[str, Any]],
+    extra_warnings: list[str] | None = None,
 ) -> ParseQuality:
     reasons: list[str] = []
-    warnings: list[str] = []
+    warnings: list[str] = list(extra_warnings or [])
 
     if not line_output.strip():
         reasons.append("Không nhận được output console-line.")
